@@ -95,16 +95,20 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	}
 	var cache helps.CodexCache
 	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
-		modelName := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
-		if modelName == "" {
-			modelName = thinking.ParseSuffix(req.Model).ModelName
-		}
-		cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, modelName, req.Payload, headers)
-		if errCache != nil {
-			return nil, nil, codexIdentityConfuseState{}, errCache
-		}
-		if ok {
-			cache = cached
+		if activePromptCache := strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt_cache_key").String()); activePromptCache != "" {
+			cache.ID = activePromptCache
+		} else {
+			modelName := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
+			if modelName == "" {
+				modelName = thinking.ParseSuffix(req.Model).ModelName
+			}
+			cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, modelName, req.Payload, headers)
+			if errCache != nil {
+				return nil, nil, codexIdentityConfuseState{}, errCache
+			}
+			if ok {
+				cache = cached
+			}
 		}
 	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
 		promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key")
@@ -162,9 +166,15 @@ func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, 
 		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-installation-id", codexIdentityConfuseUUID(auth.ID, "installation", installationID))
 	}
 	if turnMetadata := strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.x-codex-turn-metadata").String()); turnMetadata != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-turn-metadata", applyCodexTurnMetadataIdentityConfuse(turnMetadata, &state))
+		confusedMetadata := applyCodexTurnMetadataIdentityConfuse(turnMetadata, &state)
+		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-turn-metadata", confusedMetadata)
+		if turnID := strings.TrimSpace(gjson.Get(confusedMetadata, "turn_id").String()); turnID != "" {
+			rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.turn_id", turnID)
+		}
 	}
 	if state.promptCacheKey != "" {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.session_id", state.promptCacheKey)
+		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.thread_id", state.promptCacheKey)
 		if windowID := strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.x-codex-window-id").String()); windowID != "" {
 			rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-window-id", state.promptCacheKey+":0")
 		}

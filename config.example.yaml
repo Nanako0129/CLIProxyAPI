@@ -212,6 +212,10 @@ codex:
   # Some superstitious users believe request tracking identifiers can be used
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
+  # Experimental Claude-to-Codex active-turn bridge. Version 1 is advertised
+  # only with one local Codex credential and quota cooling disabled for it.
+  # Home mode and multi-credential routing intentionally fail closed.
+  active-turn-bridge: false
   # When true, optimize Codex Desktop and codex-tui requests for multi-agent v2.
   # This refreshes Codex spawn_agent model details, removes message parameter encryption,
   # normalizes encrypted agent_message content for Codex, and converts agent_message input

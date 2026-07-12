@@ -195,6 +195,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	}
 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
 	reqMeta := requestExecutionMetadata(ctx)
+	if h.AuthManager.CodexActiveTurnBridgeReady() {
+		reqMeta[coreexecutor.CodexActiveTurnBridgeMetadataKey] = true
+	}
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)

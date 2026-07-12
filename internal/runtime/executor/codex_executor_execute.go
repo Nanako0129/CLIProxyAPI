@@ -71,6 +71,13 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if errReplay != nil {
 		return resp, errReplay
 	}
+	body, activeTurn, releaseActiveTurn, errActiveTurn := e.prepareClaudeActiveTurn(ctx, from, auth, req, opts, body)
+	if errActiveTurn != nil {
+		return resp, errActiveTurn
+	}
+	if releaseActiveTurn != nil {
+		defer releaseActiveTurn()
+	}
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -82,6 +89,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	applyClaudeActiveTurnHeaders(httpReq, upstreamBody, activeTurn)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -106,6 +114,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
+	if httpResp.StatusCode >= http.StatusOK && httpResp.StatusCode < http.StatusMultipleChoices {
+		captureClaudeActiveTurnState(httpResp.Header, activeTurn)
+	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("codex executor: close response body error: %v", errClose)
@@ -114,6 +125,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
+		if isCodexUsageLimitError(b) {
+			terminateClaudeActiveTurn(activeTurn)
+		}
 		b = applyCodexIdentityConfuseResponsePayload(b, identityState)
 		if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, b); errClearReplay != nil {
 			return resp, errClearReplay
@@ -140,6 +154,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		eventType := gjson.GetBytes(eventData, "type").String()
 
 		if streamErr, terminalBody, ok := codexTerminalFailureErr(eventData); ok {
+			if isCodexUsageLimitError(terminalBody) {
+				terminateClaudeActiveTurn(activeTurn)
+			}
 			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 				return resp, errClearReplay
 			}
