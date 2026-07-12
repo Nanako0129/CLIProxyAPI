@@ -290,7 +290,8 @@ type CodexHeaderDefaults struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
-	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+	IdentityConfuse  bool `yaml:"identity-confuse" json:"identity-confuse"`
+	ActiveTurnBridge bool `yaml:"active-turn-bridge" json:"active-turn-bridge"`
 	// OptimizeMultiAgentV2 optimizes official Codex multi-agent requests.
 	OptimizeMultiAgentV2 bool `yaml:"optimize-multi-agent-v2" json:"optimize-multi-agent-v2"`
 	// LiveMediaRelay terminates and relays Codex Live WebRTC media in this process.

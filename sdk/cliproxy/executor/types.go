@@ -31,6 +31,10 @@ const ServiceTierMetadataKey = "service_tier"
 // Missing or true means generation is enabled; only an explicit false disables generation.
 const GenerateMetadataKey = "generate"
 
+// CodexActiveTurnBridgeMetadataKey is set only when the runtime has verified
+// the supported single-credential active-turn topology.
+const CodexActiveTurnBridgeMetadataKey = "codex_active_turn_bridge_ready"
+
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"

@@ -6,11 +6,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
@@ -40,6 +42,12 @@ const (
 	codexDefaultImageToolModel = "gpt-image-2"
 	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
 	codexResponsesLiteMetadata = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
+	calicoPromptIDHeader       = "X-Calico-Prompt-Id"
+	calicoActiveTurnHeader     = "X-Calico-Active-Turn-Version"
+	calicoActiveTurnVersion    = "1"
+	codexTurnStateHeader       = "X-Codex-Turn-State"
+	codexActiveTurnTTL         = 24 * time.Hour
+	codexActiveTurnMaxEntries  = 4096
 )
 
 var dataTag = []byte("data:")
@@ -281,15 +289,163 @@ func codexTerminalErrorIsContextLength(body []byte) bool {
 		strings.Contains(message, "too many tokens")
 }
 
-// CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
+// CodexExecutor handles Codex requests and retains bounded active-turn state
+// for versioned Calico Claude bridge requests.
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type CodexExecutor struct {
-	cfg *config.Config
+	cfg             *config.Config
+	activeTurnsOnce sync.Once
+	activeTurns     *helps.CodexActiveTurnStore
 }
 
 func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor{cfg: cfg} }
 
 func (e *CodexExecutor) Identifier() string { return "codex" }
+
+type codexClaudeActiveTurn struct {
+	turn        *helps.CodexActiveTurn
+	store       *helps.CodexActiveTurnStore
+	key         helps.CodexActiveTurnKey
+	promptCache string
+}
+
+func (e *CodexExecutor) codexActiveTurnStore() *helps.CodexActiveTurnStore {
+	e.activeTurnsOnce.Do(func() {
+		e.activeTurns = helps.NewCodexActiveTurnStore(codexActiveTurnTTL, codexActiveTurnMaxEntries)
+	})
+	return e.activeTurns
+}
+
+func requestHeader(ctx context.Context, headers http.Header, name string) string {
+	if headers != nil {
+		if value := strings.TrimSpace(headers.Get(name)); value != "" {
+			return value
+		}
+	}
+	if ctx != nil {
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+			return strings.TrimSpace(ginCtx.Request.Header.Get(name))
+		}
+	}
+	return ""
+}
+
+func (e *CodexExecutor) prepareClaudeActiveTurn(ctx context.Context, from sdktranslator.Format, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, body []byte) ([]byte, *codexClaudeActiveTurn, func(), error) {
+	if !sourceFormatEqual(from, sdktranslator.FormatClaude) || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return body, nil, nil, nil
+	}
+	ready, _ := opts.Metadata[cliproxyexecutor.CodexActiveTurnBridgeMetadataKey].(bool)
+	if !ready {
+		return body, nil, nil, nil
+	}
+	if requestHeader(ctx, opts.Headers, calicoActiveTurnHeader) != calicoActiveTurnVersion {
+		return body, nil, nil, nil
+	}
+	promptID := requestHeader(ctx, opts.Headers, calicoPromptIDHeader)
+	if _, errParse := uuid.Parse(promptID); errParse != nil {
+		return body, nil, nil, nil
+	}
+	sessionID := helps.ExtractClaudeCodeSessionID(ctx, req.Payload, opts.Headers)
+	if sessionID == "" {
+		return body, nil, nil, nil
+	}
+	agentID := requestHeader(ctx, opts.Headers, "X-Claude-Code-Agent-Id")
+	if agentID == "" {
+		agentID = "main"
+	}
+
+	cache, ok, errCache := helps.ClaudeCodePromptCache(ctx, req.Model, req.Payload, opts.Headers)
+	if errCache != nil {
+		return body, nil, nil, errCache
+	}
+	if !ok || strings.TrimSpace(cache.ID) == "" {
+		return body, nil, nil, nil
+	}
+
+	key := helps.CodexActiveTurnKey{
+		CredentialID: auth.ID,
+		SessionID:    sessionID,
+		AgentID:      agentID,
+		PromptID:     promptID,
+	}
+	store := e.codexActiveTurnStore()
+	turn, release, errBegin := store.Begin(ctx, key, cache.ID)
+	if errBegin != nil {
+		return body, nil, nil, errBegin
+	}
+	promptCacheID := turn.PromptCacheID()
+
+	turnMetadata, errJSON := json.Marshal(map[string]any{
+		"installation_id":         turn.InstallationID(),
+		"session_id":              promptCacheID,
+		"thread_id":               promptCacheID,
+		"turn_id":                 turn.TurnID(),
+		"window_id":               promptCacheID + ":0",
+		"prompt_cache_key":        promptCacheID,
+		"request_kind":            "turn",
+		"turn_started_at_unix_ms": turn.StartedAtUnixMilli(),
+	})
+	if errJSON != nil {
+		release()
+		return body, nil, nil, fmt.Errorf("marshal codex active turn metadata: %w", errJSON)
+	}
+	body, _ = sjson.SetBytes(body, "client_metadata.x-codex-turn-metadata", string(turnMetadata))
+	body, _ = sjson.SetBytes(body, "client_metadata.x-codex-installation-id", turn.InstallationID())
+	body, _ = sjson.SetBytes(body, "client_metadata.session_id", promptCacheID)
+	body, _ = sjson.SetBytes(body, "client_metadata.thread_id", promptCacheID)
+	body, _ = sjson.SetBytes(body, "client_metadata.x-codex-window-id", promptCacheID+":0")
+	body, _ = sjson.SetBytes(body, "client_metadata.turn_id", turn.TurnID())
+	body, _ = sjson.SetBytes(body, "prompt_cache_key", promptCacheID)
+
+	return body, &codexClaudeActiveTurn{turn: turn, store: store, key: key, promptCache: promptCacheID}, release, nil
+}
+
+func applyClaudeActiveTurnHeaders(req *http.Request, upstreamBody []byte, active *codexClaudeActiveTurn) {
+	if req == nil || active == nil || active.turn == nil {
+		return
+	}
+	turnMetadata := strings.TrimSpace(gjson.GetBytes(upstreamBody, "client_metadata.x-codex-turn-metadata").String())
+	if turnMetadata != "" {
+		req.Header.Set("X-Codex-Turn-Metadata", turnMetadata)
+	}
+	promptCache := strings.TrimSpace(gjson.GetBytes(upstreamBody, "prompt_cache_key").String())
+	if promptCache == "" {
+		promptCache = active.promptCache
+	}
+	req.Header.Set("Session_id", promptCache)
+	req.Header.Set("Session-Id", promptCache)
+	req.Header.Set("Thread-Id", promptCache)
+	req.Header.Set("X-Client-Request-Id", promptCache)
+	req.Header.Set("X-Codex-Window-Id", promptCache+":0")
+	if turnState := active.turn.TurnState(); turnState != "" {
+		req.Header.Set(codexTurnStateHeader, turnState)
+		log.WithFields(log.Fields{
+			"turn_id":      active.turn.TurnID(),
+			"state_sha256": active.turn.TurnStateFingerprint(),
+		}).Debug("codex active turn: replay state")
+	}
+}
+
+func terminateClaudeActiveTurn(active *codexClaudeActiveTurn) {
+	if active == nil || active.store == nil || active.turn == nil {
+		return
+	}
+	active.store.Terminate(active.key, active.turn)
+}
+
+func captureClaudeActiveTurnState(headers http.Header, active *codexClaudeActiveTurn) {
+	if active == nil || active.turn == nil {
+		return
+	}
+	before := active.turn.TurnState()
+	active.turn.CaptureTurnState(headers.Get(codexTurnStateHeader))
+	if before == "" && active.turn.TurnState() != "" {
+		log.WithFields(log.Fields{
+			"turn_id":      active.turn.TurnID(),
+			"state_sha256": active.turn.TurnStateFingerprint(),
+		}).Debug("codex active turn: captured state")
+	}
+}
 
 func translateCodexRequestPair(from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool) ([]byte, []byte) {
 	if bytes.Equal(originalPayload, payload) {
@@ -1154,6 +1310,13 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if errReplay != nil {
 		return resp, errReplay
 	}
+	body, activeTurn, releaseActiveTurn, errActiveTurn := e.prepareClaudeActiveTurn(ctx, from, auth, req, opts, body)
+	if errActiveTurn != nil {
+		return resp, errActiveTurn
+	}
+	if releaseActiveTurn != nil {
+		defer releaseActiveTurn()
+	}
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -1165,6 +1328,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	applyClaudeActiveTurnHeaders(httpReq, upstreamBody, activeTurn)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -1189,6 +1353,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
+	if httpResp.StatusCode >= http.StatusOK && httpResp.StatusCode < http.StatusMultipleChoices {
+		captureClaudeActiveTurnState(httpResp.Header, activeTurn)
+	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("codex executor: close response body error: %v", errClose)
@@ -1197,6 +1364,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
+		if isCodexUsageLimitError(b) {
+			terminateClaudeActiveTurn(activeTurn)
+		}
 		b = applyCodexIdentityConfuseResponsePayload(b, identityState)
 		if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, b); errClearReplay != nil {
 			return resp, errClearReplay
@@ -1223,6 +1393,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		eventType := gjson.GetBytes(eventData, "type").String()
 
 		if streamErr, terminalBody, ok := codexTerminalFailureErr(eventData); ok {
+			if isCodexUsageLimitError(terminalBody) {
+				terminateClaudeActiveTurn(activeTurn)
+			}
 			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 				return resp, errClearReplay
 			}
@@ -1429,6 +1602,16 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if errReplay != nil {
 		return nil, errReplay
 	}
+	body, activeTurn, releaseActiveTurn, errActiveTurn := e.prepareClaudeActiveTurn(ctx, from, auth, req, opts, body)
+	if errActiveTurn != nil {
+		return nil, errActiveTurn
+	}
+	releaseActiveTurnPending := releaseActiveTurn != nil
+	defer func() {
+		if releaseActiveTurnPending {
+			releaseActiveTurn()
+		}
+	}()
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -1440,6 +1623,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	applyClaudeActiveTurnHeaders(httpReq, upstreamBody, activeTurn)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -1465,6 +1649,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
+	if httpResp.StatusCode >= http.StatusOK && httpResp.StatusCode < http.StatusMultipleChoices {
+		captureClaudeActiveTurnState(httpResp.Header, activeTurn)
+	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		data, readErr := io.ReadAll(httpResp.Body)
@@ -1474,6 +1661,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		if readErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
 			return nil, readErr
+		}
+		if isCodexUsageLimitError(data) {
+			terminateClaudeActiveTurn(activeTurn)
 		}
 		data = applyCodexIdentityConfuseResponsePayload(data, identityState)
 		if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, data); errClearReplay != nil {
@@ -1485,8 +1675,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
+	releaseActiveTurnPending = false
 	go func() {
 		defer close(out)
+		if releaseActiveTurn != nil {
+			defer releaseActiveTurn()
+		}
 		defer func() {
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("codex executor: close response body error: %v", errClose)
@@ -1510,6 +1704,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				translatedLine = append([]byte("data: "), data...)
 				eventType := gjson.GetBytes(data, "type").String()
 				if streamErr, terminalBody, ok := codexTerminalFailureErr(data); ok {
+					if isCodexUsageLimitError(terminalBody) {
+						terminateClaudeActiveTurn(activeTurn)
+					}
 					if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 						helps.RecordAPIResponseError(ctx, e.cfg, errClearReplay)
 						reporter.PublishFailure(ctx, errClearReplay)
@@ -1795,16 +1992,20 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	}
 	var cache helps.CodexCache
 	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
-		modelName := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
-		if modelName == "" {
-			modelName = thinking.ParseSuffix(req.Model).ModelName
-		}
-		cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, modelName, req.Payload, headers)
-		if errCache != nil {
-			return nil, nil, codexIdentityConfuseState{}, errCache
-		}
-		if ok {
-			cache = cached
+		if activePromptCache := strings.TrimSpace(gjson.GetBytes(rawJSON, "prompt_cache_key").String()); activePromptCache != "" {
+			cache.ID = activePromptCache
+		} else {
+			modelName := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
+			if modelName == "" {
+				modelName = thinking.ParseSuffix(req.Model).ModelName
+			}
+			cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, modelName, req.Payload, headers)
+			if errCache != nil {
+				return nil, nil, codexIdentityConfuseState{}, errCache
+			}
+			if ok {
+				cache = cached
+			}
 		}
 	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
 		promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key")
@@ -1851,9 +2052,15 @@ func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, 
 		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-installation-id", codexIdentityConfuseUUID(auth.ID, "installation", installationID))
 	}
 	if turnMetadata := strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.x-codex-turn-metadata").String()); turnMetadata != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-turn-metadata", applyCodexTurnMetadataIdentityConfuse(turnMetadata, &state))
+		confusedMetadata := applyCodexTurnMetadataIdentityConfuse(turnMetadata, &state)
+		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-turn-metadata", confusedMetadata)
+		if turnID := strings.TrimSpace(gjson.Get(confusedMetadata, "turn_id").String()); turnID != "" {
+			rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.turn_id", turnID)
+		}
 	}
 	if state.promptCacheKey != "" {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.session_id", state.promptCacheKey)
+		rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.thread_id", state.promptCacheKey)
 		if windowID := strings.TrimSpace(gjson.GetBytes(rawJSON, "client_metadata.x-codex-window-id").String()); windowID != "" {
 			rawJSON, _ = sjson.SetBytes(rawJSON, "client_metadata.x-codex-window-id", state.promptCacheKey+":0")
 		}

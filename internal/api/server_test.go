@@ -1481,7 +1481,6 @@ func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
 	}
-
 	var resp struct {
 		Models []map[string]any `json:"models"`
 		Object string           `json:"object"`
@@ -1578,6 +1577,43 @@ func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
 		if !found {
 			t.Fatalf("expected hidden model %s in codex catalog", slug)
 		}
+	}
+}
+
+func TestModelsWithClientVersionAdvertisesCodexActiveTurn(t *testing.T) {
+	server := newTestServer(t)
+	server.cfg.Codex.ActiveTurnBridge = true
+	server.handlers.AuthManager.SetConfig(server.cfg)
+	if _, err := server.handlers.AuthManager.Register(context.Background(), &auth.Auth{
+		ID:       "codex-active-turn",
+		Provider: "codex",
+		Metadata: map[string]any{"disable_cooling": true},
+	}); err != nil {
+		t.Fatalf("register codex auth: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=remora", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if got := rr.Header().Get("X-CLIProxyAPI-Codex-Active-Turn"); got != "1" {
+		t.Fatalf("active-turn capability header = %q, want 1", got)
+	}
+}
+
+func TestModelsWithClientVersionDoesNotAdvertiseCodexActiveTurnWhenUnready(t *testing.T) {
+	server := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version=remora", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+	if got := rr.Header().Get("X-CLIProxyAPI-Codex-Active-Turn"); got != "" {
+		t.Fatalf("unready active-turn capability header = %q, want empty", got)
 	}
 }
 
