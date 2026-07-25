@@ -1332,7 +1332,8 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		return payload, true, nil
 	}
 
-	var bootstrapPayload []byte
+	var bootstrapPayloads [][]byte
+	var bootstrapProvisionalPayloads [][]byte
 	bootstrapChunkIndex := 0
 	var bootstrapHistoryChunks [][]byte
 	var bootstrapStreamErr error
@@ -1363,16 +1364,29 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 			if len(chunk.Payload) == 0 {
 				continue
 			}
-			payload, deliverable, errMsg := transformStreamPayload(chunk.Payload, &bootstrapChunkIndex, bootstrapHistoryChunks)
-			if errMsg != nil {
-				bootstrapErr = errMsg
-				return
-			}
-			if !deliverable {
+			if chunk.Provisional {
+				bootstrapProvisionalPayloads = append(bootstrapProvisionalPayloads, cloneBytes(chunk.Payload))
 				continue
 			}
-			bootstrapPayload = payload
-			return
+			pendingPayloads := append(bootstrapProvisionalPayloads, chunk.Payload)
+			bootstrapProvisionalPayloads = nil
+			for _, pendingPayload := range pendingPayloads {
+				payload, deliverable, errMsg := transformStreamPayload(pendingPayload, &bootstrapChunkIndex, bootstrapHistoryChunks)
+				if errMsg != nil {
+					bootstrapErr = errMsg
+					return
+				}
+				if !deliverable {
+					continue
+				}
+				bootstrapPayloads = append(bootstrapPayloads, payload)
+				if streamInterceptorsActive {
+					bootstrapHistoryChunks = appendStreamInterceptorHistory(bootstrapHistoryChunks, payload)
+				}
+			}
+			if len(bootstrapPayloads) > 0 {
+				return
+			}
 		}
 	}
 
@@ -1414,7 +1428,8 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		streamHeaderInitialized = false
 		streamClosedBeforeRead = false
 		bootstrapStreamErr = nil
-		bootstrapPayload = nil
+		bootstrapPayloads = nil
+		bootstrapProvisionalPayloads = nil
 		bootstrapChunkIndex = 0
 		bootstrapHistoryChunks = nil
 		chunks = retryResult.Chunks
@@ -1472,12 +1487,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 
 		chunkIndex := bootstrapChunkIndex
 		historyChunks := bootstrapHistoryChunks
-		if bootstrapPayload != nil {
+		for _, bootstrapPayload := range bootstrapPayloads {
 			if okSendData := sendData(bootstrapPayload); !okSendData {
 				return
-			}
-			if streamInterceptorsActive {
-				historyChunks = appendStreamInterceptorHistory(historyChunks, bootstrapPayload)
 			}
 		}
 		for {

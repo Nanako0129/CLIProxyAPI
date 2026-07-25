@@ -142,6 +142,9 @@ type Response struct {
 type StreamChunk struct {
 	// Payload is the raw provider chunk payload.
 	Payload []byte
+	// Provisional marks output that may be discarded and retried before any
+	// externally meaningful response content has been emitted.
+	Provisional bool
 	// Err reports any terminal error encountered while producing chunks.
 	Err error
 }
