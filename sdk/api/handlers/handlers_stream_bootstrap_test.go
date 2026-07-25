@@ -555,6 +555,39 @@ func TestExecuteStreamWithAuthManager_RetriesAfterDroppedBootstrapPayload(t *tes
 	}
 }
 
+func TestExecuteStreamWithAuthManager_RetriesAfterProvisionalPayloads(t *testing.T) {
+	executor := &bootstrapStreamExecutor{stream: func(_ context.Context, call int) (*coreexecutor.StreamResult, error) {
+		chunks := make(chan coreexecutor.StreamChunk, 3)
+		if call == 1 {
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("discarded-thinking"), Provisional: true}
+			chunks <- coreexecutor.StreamChunk{Err: &coreauth.Error{HTTPStatus: http.StatusRequestTimeout, Message: "upstream closed"}}
+		} else {
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("retried-thinking"), Provisional: true}
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("answer")}
+		}
+		close(chunks)
+		return &coreexecutor.StreamResult{Chunks: chunks}, nil
+	}}
+	handler, _ := registerBootstrapExecutor(t, executor)
+
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "bootstrap-model", []byte(`{"model":"bootstrap-model"}`), "")
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected stream error: %+v", msg)
+		}
+	}
+	if string(got) != "retried-thinkinganswer" {
+		t.Fatalf("stream payload = %q, want retried provisional payload followed by answer", got)
+	}
+	if executor.Calls() != 2 {
+		t.Fatalf("stream attempts = %d, want 2", executor.Calls())
+	}
+}
+
 func TestExecuteStreamWithAuthManager_CancelDuringSynchronousBootstrap(t *testing.T) {
 	started := make(chan struct{})
 	executor := &bootstrapStreamExecutor{stream: func(_ context.Context, _ int) (*coreexecutor.StreamResult, error) {

@@ -211,6 +211,81 @@ func TestCodexExecutorExecuteStreamMissingCompletionIsRequestScoped(t *testing.T
 	assertRequestScopedTestError(t, streamErr)
 }
 
+func TestCodexExecutorExecuteStreamMarksThinkingOnlyOutputProvisional(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}` + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.reasoning_summary_part.added","item_id":"rs_1","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}` + "\n\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"working"}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: []byte(`{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatClaude,
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var payloads int
+	var streamErr error
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+			continue
+		}
+		if len(chunk.Payload) == 0 {
+			continue
+		}
+		payloads++
+		if !chunk.Provisional {
+			t.Fatalf("thinking-only payload was committed: %s", chunk.Payload)
+		}
+	}
+	if payloads == 0 {
+		t.Fatal("expected translated thinking payloads")
+	}
+	if streamErr == nil {
+		t.Fatal("expected missing-completion stream error")
+	}
+}
+
+func TestClaudeStreamChunksCommitOutput(t *testing.T) {
+	tests := []struct {
+		name  string
+		chunk string
+		want  bool
+	}{
+		{name: "message start", chunk: `data: {"type":"message_start"}`},
+		{name: "thinking delta", chunk: `data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"working"}}`},
+		{name: "signature delta", chunk: `data: {"type":"content_block_delta","delta":{"type":"signature_delta","signature":"sig"}}`},
+		{name: "text block start", chunk: `data: {"type":"content_block_start","content_block":{"type":"text","text":""}}`},
+		{name: "text delta", chunk: `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"answer"}}`, want: true},
+		{name: "tool use", chunk: `data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"tool_1","name":"lookup","input":{}}}`, want: true},
+		{name: "terminal", chunk: `data: {"type":"message_stop"}`, want: true},
+		{name: "unknown", chunk: `data: {"type":"future_event"}`, want: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := claudeStreamChunksCommitOutput([][]byte{[]byte(tc.chunk)})
+			if got != tc.want {
+				t.Fatalf("claudeStreamChunksCommitOutput() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCodexExecutorExecuteStreamExplicitTerminalFailureIsNotSuccessful(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

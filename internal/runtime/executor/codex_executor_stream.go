@@ -19,6 +19,44 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+func claudeStreamChunksCommitOutput(chunks [][]byte) bool {
+	for _, chunk := range chunks {
+		for _, line := range bytes.Split(chunk, []byte("\n")) {
+			line = bytes.TrimSpace(line)
+			if !bytes.HasPrefix(line, dataTag) {
+				continue
+			}
+			event := gjson.ParseBytes(bytes.TrimSpace(line[len(dataTag):]))
+			switch event.Get("type").String() {
+			case "message_start", "ping", "content_block_stop":
+				continue
+			case "content_block_start":
+				switch event.Get("content_block.type").String() {
+				case "thinking", "redacted_thinking", "text":
+					continue
+				default:
+					return true
+				}
+			case "content_block_delta":
+				switch event.Get("delta.type").String() {
+				case "thinking_delta", "signature_delta":
+					continue
+				case "text_delta":
+					if event.Get("delta.text").String() == "" {
+						continue
+					}
+					return true
+				default:
+					return true
+				}
+			default:
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
@@ -161,6 +199,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
+		downstreamCommitted := responseFormat != sdktranslator.FormatClaude
 		for scanner.Scan() {
 			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -212,9 +251,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, identityState)
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, body, translatedLine, &param, claudeInputTokens)
+			if !downstreamCommitted && claudeStreamChunksCommitOutput(chunks) {
+				downstreamCommitted = true
+			}
 			for i := range chunks {
 				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i], Provisional: !downstreamCommitted}:
 				case <-ctx.Done():
 					return
 				}
