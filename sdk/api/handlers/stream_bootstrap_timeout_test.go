@@ -294,6 +294,55 @@ func TestReleaseStreamBootstrapAttemptResetsIdleTimerOnActivity(t *testing.T) {
 	}
 }
 
+func TestReleaseStreamBootstrapAttemptIgnoresEmptyChunksForIdleProgress(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	remaining := make(chan coreexecutor.StreamChunk)
+	producerDone := make(chan struct{})
+	go func() {
+		defer close(producerDone)
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				select {
+				case <-ctx.Done():
+					return
+				case remaining <- coreexecutor.StreamChunk{}:
+				}
+			}
+		}
+	}()
+
+	started := time.Now()
+	result := releaseStreamBootstrapAttempt(
+		&coreexecutor.StreamResult{Chunks: remaining},
+		ctx,
+		cancel,
+		80*time.Millisecond,
+	)
+	timeoutChunk, ok := <-result.Chunks
+	if !ok || timeoutChunk.Err == nil {
+		t.Fatalf("timeout chunk = %#v, %t", timeoutChunk, ok)
+	}
+	if elapsed := time.Since(started); elapsed < 60*time.Millisecond || elapsed > 250*time.Millisecond {
+		t.Fatalf("idle timeout elapsed = %s, want 60ms..250ms", elapsed)
+	}
+	if !errors.Is(timeoutChunk.Err, context.DeadlineExceeded) {
+		t.Fatalf("timeout error = %v, want context deadline exceeded", timeoutChunk.Err)
+	}
+	if extra, okExtra := <-result.Chunks; okExtra {
+		t.Fatalf("unexpected extra chunk: %#v", extra)
+	}
+	select {
+	case <-producerDone:
+	case <-time.After(time.Second):
+		t.Fatal("empty-chunk producer was not canceled")
+	}
+}
+
 func TestReleaseStreamBootstrapAttemptDoesNotTimeDownstreamBackpressure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	remaining := make(chan coreexecutor.StreamChunk, 2)

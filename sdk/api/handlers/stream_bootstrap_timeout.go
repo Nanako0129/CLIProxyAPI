@@ -151,21 +151,31 @@ func receiveStreamChunkWithIdleTimeout(ctx context.Context, chunks <-chan coreex
 		}
 	}()
 
-	select {
-	case <-ctx.Done():
-		return coreexecutor.StreamChunk{}, false, ctx.Err()
-	case chunk, ok := <-chunks:
-		return chunk, ok, nil
-	case <-timer.C:
-		// Linearize cancellation at the timer wake, then prefer an upstream
-		// payload or clean close that is already observable at that instant.
-		if err := ctx.Err(); err != nil {
-			return coreexecutor.StreamChunk{}, false, err
-		}
+	for {
 		select {
+		case <-ctx.Done():
+			return coreexecutor.StreamChunk{}, false, ctx.Err()
 		case chunk, ok := <-chunks:
-			return chunk, ok, nil
-		default:
+			if !ok || chunk.Err != nil || len(chunk.Payload) > 0 {
+				return chunk, ok, nil
+			}
+			// Executors may emit empty bookkeeping chunks for upstream events
+			// that translators intentionally suppress. Downstream drops them,
+			// so they are not stream progress and must not reset the idle timer.
+		case <-timer.C:
+			// Linearize cancellation at the timer wake, then prefer a meaningful
+			// upstream payload, terminal error, or clean close that is already
+			// observable at that instant.
+			if err := ctx.Err(); err != nil {
+				return coreexecutor.StreamChunk{}, false, err
+			}
+			select {
+			case chunk, ok := <-chunks:
+				if !ok || chunk.Err != nil || len(chunk.Payload) > 0 {
+					return chunk, ok, nil
+				}
+			default:
+			}
 			return coreexecutor.StreamChunk{}, false, &streamIdleTimeoutError{timeout: timeout}
 		}
 	}
