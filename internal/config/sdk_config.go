@@ -75,4 +75,9 @@ type StreamingConfig struct {
 	// A timed-out attempt is canceled and may consume one BootstrapRetries retry.
 	// <= 0 disables the timeout. Values above 600 are capped at 600 seconds.
 	BootstrapTimeoutSeconds int `yaml:"bootstrap-timeout-seconds,omitempty" json:"bootstrap-timeout-seconds,omitempty"`
+
+	// IdleTimeoutSeconds limits how long an established upstream stream may go without another payload.
+	// The timeout is suspended while a payload is blocked on downstream delivery.
+	// <= 0 disables the timeout. Values above 600 are capped at 600 seconds.
+	IdleTimeoutSeconds int `yaml:"idle-timeout-seconds,omitempty" json:"idle-timeout-seconds,omitempty"`
 }

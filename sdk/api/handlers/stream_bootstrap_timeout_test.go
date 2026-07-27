@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"testing"
@@ -109,7 +110,7 @@ func (e *bootstrapTimeoutExecutor) snapshot() (int, []string) {
 	return e.calls, append([]string(nil), e.authIDs...)
 }
 
-func newBootstrapTimeoutHandler(t *testing.T, executor *bootstrapTimeoutExecutor, retries, timeoutSeconds int, authIDs ...string) *BaseAPIHandler {
+func newBootstrapTimeoutHandler(t *testing.T, executor *bootstrapTimeoutExecutor, retries, timeoutSeconds, idleTimeoutSeconds int, authIDs ...string) *BaseAPIHandler {
 	t.Helper()
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
@@ -125,6 +126,7 @@ func newBootstrapTimeoutHandler(t *testing.T, executor *bootstrapTimeoutExecutor
 	return NewBaseAPIHandlers(&sdkconfig.SDKConfig{Streaming: sdkconfig.StreamingConfig{
 		BootstrapRetries:        retries,
 		BootstrapTimeoutSeconds: timeoutSeconds,
+		IdleTimeoutSeconds:      idleTimeoutSeconds,
 	}}, manager)
 }
 
@@ -157,9 +159,24 @@ func TestStreamingBootstrapTimeoutBounds(t *testing.T) {
 	}
 }
 
+func TestStreamingIdleTimeoutBounds(t *testing.T) {
+	if got := StreamingIdleTimeout(nil); got != 0 {
+		t.Fatalf("nil config timeout = %s, want 0", got)
+	}
+	if got := StreamingIdleTimeout(&sdkconfig.SDKConfig{Streaming: sdkconfig.StreamingConfig{IdleTimeoutSeconds: -1}}); got != 0 {
+		t.Fatalf("disabled timeout = %s, want 0", got)
+	}
+	if got := StreamingIdleTimeout(&sdkconfig.SDKConfig{Streaming: sdkconfig.StreamingConfig{IdleTimeoutSeconds: 30}}); got != 30*time.Second {
+		t.Fatalf("timeout = %s, want 30s", got)
+	}
+	if got := StreamingIdleTimeout(&sdkconfig.SDKConfig{Streaming: sdkconfig.StreamingConfig{IdleTimeoutSeconds: 9999}}); got != 10*time.Minute {
+		t.Fatalf("capped timeout = %s, want 10m", got)
+	}
+}
+
 func TestStreamBootstrapTimeoutCancelsAndRetries(t *testing.T) {
 	executor := &bootstrapTimeoutExecutor{stallFirst: true, canceled: make(chan struct{})}
-	handler := newBootstrapTimeoutHandler(t, executor, 1, 1, "auth1", "auth2")
+	handler := newBootstrapTimeoutHandler(t, executor, 1, 1, 0, "auth1", "auth2")
 	started := time.Now()
 	body, status := collectBootstrapTimeoutResult(handler)
 	if status != 0 || string(body) != "first" {
@@ -181,7 +198,7 @@ func TestStreamBootstrapTimeoutCancelsAndRetries(t *testing.T) {
 
 func TestStreamBootstrapTimeoutReturnsGatewayTimeoutWithoutRetry(t *testing.T) {
 	executor := &bootstrapTimeoutExecutor{stallFirst: true, canceled: make(chan struct{})}
-	handler := newBootstrapTimeoutHandler(t, executor, 0, 1, "auth1")
+	handler := newBootstrapTimeoutHandler(t, executor, 0, 1, 0, "auth1")
 	body, status := collectBootstrapTimeoutResult(handler)
 	if len(body) != 0 || status != http.StatusGatewayTimeout {
 		t.Fatalf("status=%d body=%q", status, body)
@@ -190,7 +207,7 @@ func TestStreamBootstrapTimeoutReturnsGatewayTimeoutWithoutRetry(t *testing.T) {
 
 func TestStreamBootstrapTimeoutDisarmsAfterFirstPayload(t *testing.T) {
 	executor := &bootstrapTimeoutExecutor{firstDelay: 100 * time.Millisecond, betweenPayload: 1100 * time.Millisecond, streamCanceled: make(chan struct{})}
-	handler := newBootstrapTimeoutHandler(t, executor, 0, 1, "auth1")
+	handler := newBootstrapTimeoutHandler(t, executor, 0, 1, 0, "auth1")
 	body, status := collectBootstrapTimeoutResult(handler)
 	if status != 0 || string(body) != "firstsecond" {
 		t.Fatalf("status=%d body=%q", status, body)
@@ -202,5 +219,200 @@ func TestStreamBootstrapTimeoutDisarmsAfterFirstPayload(t *testing.T) {
 	case <-executor.streamCanceled:
 	case <-time.After(time.Second):
 		t.Fatal("bootstrap attempt context was not released after stream completion")
+	}
+}
+
+func TestReleaseStreamBootstrapAttemptTimesOutOnceAndCancels(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	remaining := make(chan coreexecutor.StreamChunk, 1)
+	remaining <- coreexecutor.StreamChunk{Payload: []byte("first")}
+	result := releaseStreamBootstrapAttempt(
+		&coreexecutor.StreamResult{Chunks: remaining},
+		ctx,
+		cancel,
+		30*time.Millisecond,
+	)
+
+	first, ok := <-result.Chunks
+	if !ok || string(first.Payload) != "first" || first.Err != nil {
+		t.Fatalf("first chunk = %#v, %t", first, ok)
+	}
+	timeoutChunk, ok := <-result.Chunks
+	if !ok || timeoutChunk.Err == nil {
+		t.Fatalf("timeout chunk = %#v, %t", timeoutChunk, ok)
+	}
+	if !errors.Is(timeoutChunk.Err, context.DeadlineExceeded) {
+		t.Fatalf("timeout error = %v, want context deadline exceeded", timeoutChunk.Err)
+	}
+	statusErr, okStatus := timeoutChunk.Err.(interface{ StatusCode() int })
+	if !okStatus || statusErr.StatusCode() != http.StatusGatewayTimeout {
+		t.Fatalf("timeout status = %v, %t", statusErr, okStatus)
+	}
+	if extra, okExtra := <-result.Chunks; okExtra {
+		t.Fatalf("unexpected extra chunk: %#v", extra)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("timed-out stream context was not canceled")
+	}
+	close(remaining)
+}
+
+func TestReleaseStreamBootstrapAttemptResetsIdleTimerOnActivity(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	remaining := make(chan coreexecutor.StreamChunk)
+	go func() {
+		defer close(remaining)
+		for i := byte('a'); i <= byte('g'); i++ {
+			if i != byte('a') {
+				time.Sleep(50 * time.Millisecond)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case remaining <- coreexecutor.StreamChunk{Payload: []byte{i}}:
+			}
+		}
+	}()
+	result := releaseStreamBootstrapAttempt(
+		&coreexecutor.StreamResult{Chunks: remaining},
+		ctx,
+		cancel,
+		250*time.Millisecond,
+	)
+
+	var body []byte
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+		body = append(body, chunk.Payload...)
+	}
+	if string(body) != "abcdefg" {
+		t.Fatalf("body = %q, want abcdefg", body)
+	}
+}
+
+func TestReleaseStreamBootstrapAttemptDoesNotTimeDownstreamBackpressure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	remaining := make(chan coreexecutor.StreamChunk, 2)
+	remaining <- coreexecutor.StreamChunk{Payload: []byte("first")}
+	remaining <- coreexecutor.StreamChunk{Payload: []byte("second")}
+	close(remaining)
+	result := releaseStreamBootstrapAttempt(
+		&coreexecutor.StreamResult{Chunks: remaining},
+		ctx,
+		cancel,
+		30*time.Millisecond,
+	)
+
+	time.Sleep(100 * time.Millisecond)
+	var body []byte
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("backpressure produced timeout: %v", chunk.Err)
+		}
+		body = append(body, chunk.Payload...)
+	}
+	if string(body) != "firstsecond" {
+		t.Fatalf("body = %q, want firstsecond", body)
+	}
+}
+
+func TestReleaseStreamBootstrapAttemptParentCancellationClosesSilently(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	remaining := make(chan coreexecutor.StreamChunk)
+	result := releaseStreamBootstrapAttempt(
+		&coreexecutor.StreamResult{Chunks: remaining},
+		ctx,
+		cancel,
+		time.Second,
+	)
+	cancel()
+	select {
+	case chunk, ok := <-result.Chunks:
+		if ok {
+			t.Fatalf("unexpected chunk after cancellation: %#v", chunk)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stream did not close after parent cancellation")
+	}
+	close(remaining)
+}
+
+func TestReceiveStreamChunkIdleTimeoutPreEstablishedPrecedence(t *testing.T) {
+	t.Run("parent cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		chunks := make(chan coreexecutor.StreamChunk, 1)
+		chunks <- coreexecutor.StreamChunk{Payload: []byte("late")}
+		_, _, err := receiveStreamChunkWithIdleTimeout(ctx, chunks, time.Nanosecond)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context canceled", err)
+		}
+	})
+
+	t.Run("buffered chunk", func(t *testing.T) {
+		chunks := make(chan coreexecutor.StreamChunk, 1)
+		chunks <- coreexecutor.StreamChunk{Payload: []byte("ready")}
+		chunk, ok, err := receiveStreamChunkWithIdleTimeout(context.Background(), chunks, time.Nanosecond)
+		if err != nil || !ok || string(chunk.Payload) != "ready" {
+			t.Fatalf("chunk=%#v ok=%t err=%v", chunk, ok, err)
+		}
+	})
+
+	t.Run("clean close", func(t *testing.T) {
+		chunks := make(chan coreexecutor.StreamChunk)
+		close(chunks)
+		_, ok, err := receiveStreamChunkWithIdleTimeout(context.Background(), chunks, time.Nanosecond)
+		if err != nil || ok {
+			t.Fatalf("ok=%t err=%v, want clean close", ok, err)
+		}
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		chunks := make(chan coreexecutor.StreamChunk)
+		_, ok, err := receiveStreamChunkWithIdleTimeout(context.Background(), chunks, 5*time.Millisecond)
+		var timeoutErr *streamIdleTimeoutError
+		if ok || !errors.As(err, &timeoutErr) {
+			t.Fatalf("ok=%t err=%v, want idle timeout", ok, err)
+		}
+	})
+}
+
+func TestReceiveStreamChunkIdleTimeoutConcurrentBoundaryTerminates(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		chunks := make(chan coreexecutor.StreamChunk, 1)
+		var action sync.WaitGroup
+		action.Add(1)
+		go func(mode int) {
+			defer action.Done()
+			time.Sleep(time.Millisecond)
+			switch mode {
+			case 0:
+				cancel()
+			case 1:
+				chunks <- coreexecutor.StreamChunk{Payload: []byte("ready")}
+			default:
+				close(chunks)
+			}
+		}(i % 3)
+
+		chunk, ok, err := receiveStreamChunkWithIdleTimeout(ctx, chunks, time.Millisecond)
+		cancel()
+		action.Wait()
+
+		if err != nil {
+			var timeoutErr *streamIdleTimeoutError
+			if !errors.Is(err, context.Canceled) && !errors.As(err, &timeoutErr) {
+				t.Fatalf("iteration %d unexpected error: %v", i, err)
+			}
+			continue
+		}
+		if ok && string(chunk.Payload) != "ready" {
+			t.Fatalf("iteration %d unexpected chunk: %#v", i, chunk)
+		}
 	}
 }

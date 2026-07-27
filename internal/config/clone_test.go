@@ -99,6 +99,7 @@ func sampleCloneRuntimeConfig() *Config {
 				KeepAliveSeconds:        3,
 				BootstrapRetries:        2,
 				BootstrapTimeoutSeconds: 20,
+				IdleTimeoutSeconds:      30,
 			},
 		},
 		Home: HomeConfig{
