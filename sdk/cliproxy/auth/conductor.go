@@ -3303,8 +3303,13 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			models = models[:1]
 			pooled = false
 		}
-		// Compact single-shot also disables same-credential refresh retries.
+		// Compact single-shot also disables same-credential refresh retries and
+		// multi-model pool walk on the same credential.
 		allowInCredentialRetry := !homeMode && !disableStreamRetriesFromOptions(opts)
+		if disableStreamRetriesFromOptions(opts) && len(models) > 1 {
+			models = models[:1]
+			pooled = false
+		}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, allowInCredentialRetry, selection != nil)
 		if errStream != nil {
 			if selection != nil {

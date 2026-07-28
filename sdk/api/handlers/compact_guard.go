@@ -168,6 +168,9 @@ func releaseCompactAbsoluteTimeout(result *coreexecutor.StreamResult, cancel con
 				return
 			case chunk, ok := <-remaining:
 				if !ok {
+					// Upstream may close the channel after cancel without an
+					// error chunk; still surface compact timeout if our timer fired.
+					sendTimeout()
 					return
 				}
 				select {
