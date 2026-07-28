@@ -1544,6 +1544,10 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	httpClient = reporter.TrackHTTPClient(httpClient)
 
 	attempts := antigravityRetryAttempts(auth, e.cfg)
+	if cliproxyexecutorDisableStreamRetries(opts) {
+		// Compact / single-shot stream guards: one executor attempt only.
+		attempts = 1
+	}
 
 attemptLoop:
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -1552,6 +1556,10 @@ attemptLoop:
 		var lastErr error
 
 		for idx, baseURL := range baseURLs {
+			if cliproxyexecutorDisableStreamRetries(opts) && idx > 0 {
+				// No base-URL fallback walk under single-shot stream guards.
+				break
+			}
 			requestPayload := translated
 			if useCredits {
 				if cp := injectEnabledCreditTypes(translated); len(cp) > 0 {
@@ -2654,6 +2662,24 @@ func antigravityRetryAttempts(auth *cliproxyauth.Auth, cfg *config.Config) int {
 		return 1
 	}
 	return attempts
+}
+
+func cliproxyexecutorDisableStreamRetries(opts cliproxyexecutor.Options) bool {
+	if opts.Metadata == nil {
+		return false
+	}
+	value, ok := opts.Metadata[cliproxyexecutor.DisableStreamRetriesMetadataKey]
+	if !ok || value == nil {
+		return false
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "true") || strings.TrimSpace(typed) == "1"
+	default:
+		return false
+	}
 }
 
 func antigravityShouldRetryNoCapacity(statusCode int, body []byte) bool {

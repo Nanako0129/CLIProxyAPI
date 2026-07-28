@@ -131,12 +131,17 @@ func CompactTimeoutErrorIfDeadline(state *compactTimeoutState) error {
 
 // releaseCompactAbsoluteTimeout keeps the absolute deadline armed while chunks
 // are consumed and surfaces a gateway-timeout error when the compact timer fires.
-func releaseCompactAbsoluteTimeout(result *coreexecutor.StreamResult, cancel context.CancelFunc, ctx context.Context, state *compactTimeoutState) *coreexecutor.StreamResult {
+// streamCtx is the attempt context (compact timer). parentCtx is the caller
+// request context and is used only to abandon a blocked terminal-error send.
+func releaseCompactAbsoluteTimeout(result *coreexecutor.StreamResult, cancel context.CancelFunc, streamCtx, parentCtx context.Context, state *compactTimeoutState) *coreexecutor.StreamResult {
 	if result == nil || result.Chunks == nil {
 		if cancel != nil {
 			cancel()
 		}
 		return result
+	}
+	if parentCtx == nil {
+		parentCtx = context.Background()
 	}
 	remaining := result.Chunks
 	// Buffer one chunk so a terminal compact timeout error is not dropped when
@@ -150,13 +155,10 @@ func releaseCompactAbsoluteTimeout(result *coreexecutor.StreamResult, cancel con
 		}
 		sendTimeout := func() {
 			if err := CompactTimeoutErrorIfDeadline(state); err != nil {
-				// Keep the terminal error queued until a consumer takes it.
-				// Prefer not to drop on arbitrary wall-clock; only abandon if
-				// the parent request context is already gone and nobody is reading.
+				// Stay queued until consumed or the parent request ends.
 				select {
 				case out <- coreexecutor.StreamChunk{Err: err}:
-				case <-ctx.Done():
-					// Compact timer already fired; still try once more non-blocking.
+				case <-parentCtx.Done():
 					select {
 					case out <- coreexecutor.StreamChunk{Err: err}:
 					default:
@@ -166,7 +168,7 @@ func releaseCompactAbsoluteTimeout(result *coreexecutor.StreamResult, cancel con
 		}
 		for {
 			select {
-			case <-ctx.Done():
+			case <-streamCtx.Done():
 				sendTimeout()
 				return
 			case chunk, ok := <-remaining:
@@ -177,7 +179,7 @@ func releaseCompactAbsoluteTimeout(result *coreexecutor.StreamResult, cancel con
 					return
 				}
 				select {
-				case <-ctx.Done():
+				case <-streamCtx.Done():
 					sendTimeout()
 					return
 				case out <- chunk:

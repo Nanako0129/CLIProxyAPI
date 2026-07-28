@@ -1084,7 +1084,7 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		// Keep the parent ctx for the consumer loop so a compact timeout chunk
 		// can be read after streamCtx cancels (releaseCompactAbsoluteTimeout
 		// still uses streamCtx for the producer side).
-		streamResult = releaseCompactAbsoluteTimeout(streamResult, compactCancel, streamCtx, compactState)
+		streamResult = releaseCompactAbsoluteTimeout(streamResult, compactCancel, streamCtx, ctx, compactState)
 		compactCancel = nil
 	} else if compactCancel != nil {
 		compactCancel()
@@ -1291,7 +1291,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		}
 	} else if compactCancel != nil && streamResult != nil && streamResult.Chunks != nil {
 		// Keep the absolute deadline armed for the lifetime of the chunk channel.
-		streamResult = releaseCompactAbsoluteTimeout(streamResult, compactCancel, streamCtx, compactState)
+		streamResult = releaseCompactAbsoluteTimeout(streamResult, compactCancel, streamCtx, ctx, compactState)
 		compactCancel = nil
 	} else if compactCancel != nil {
 		compactCancel()
