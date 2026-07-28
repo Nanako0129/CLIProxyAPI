@@ -1081,13 +1081,16 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		return nil, nil, errChan
 	}
 	if compactCancel != nil && streamResult.Chunks != nil {
+		// Keep the parent ctx for the consumer loop so a compact timeout chunk
+		// can be read after streamCtx cancels (releaseCompactAbsoluteTimeout
+		// still uses streamCtx for the producer side).
 		streamResult = releaseCompactAbsoluteTimeout(streamResult, compactCancel, streamCtx, compactState)
 		compactCancel = nil
 	} else if compactCancel != nil {
 		compactCancel()
 	}
-	// Use streamCtx for consumer cancellation so compact deadlines surface downstream.
-	ctx = streamCtx
+	// Do not reassign consumer ctx to streamCtx: parent cancel still ends the
+	// client loop, while compact terminal errors are delivered on the channel.
 
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	interceptorHost := h.interceptorHost()
