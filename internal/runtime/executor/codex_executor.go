@@ -89,7 +89,12 @@ func claudeStreamChunksCommitOutput(chunks [][]byte) bool {
 				}
 			case "content_block_delta":
 				switch event.Get("delta.type").String() {
-				case "thinking_delta", "signature_delta":
+				case "thinking_delta":
+					if event.Get("delta.thinking").String() == "" {
+						continue
+					}
+					return true
+				case "signature_delta":
 					continue
 				case "text_delta":
 					if event.Get("delta.text").String() == "" {
