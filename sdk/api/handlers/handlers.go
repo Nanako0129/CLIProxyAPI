@@ -1327,6 +1327,11 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	interceptorHost := h.interceptorHost()
 	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
+	// Bound interceptor work by compact attempt context when armed.
+	interceptorCtx := streamCtx
+	if interceptorCtx == nil {
+		interceptorCtx = ctx
+	}
 	// Resolve bootstrap retries and header initialization before returning so the
 	// returned header snapshot is never modified by the stream goroutine.
 	rawStreamHeaders := cloneHeader(streamResult.Headers)
@@ -1350,7 +1355,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 			return
 		}
 		executedReq, executedOpts := executedRequest()
-		intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+		intercepted := interceptStreamChunk(interceptorCtx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
 			SourceFormat:    responseProtocol,
 			Model:           normalizedModel,
 			RequestedModel:  originalRequestedModel,
@@ -1370,7 +1375,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		payload = cloneBytes(payload)
 		if streamInterceptorsActive {
 			executedReq, executedOpts := executedRequest()
-			intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+			intercepted := interceptStreamChunk(interceptorCtx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
 				SourceFormat:    responseProtocol,
 				Model:           normalizedModel,
 				RequestedModel:  originalRequestedModel,
