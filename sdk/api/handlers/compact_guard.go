@@ -150,14 +150,17 @@ func releaseCompactAbsoluteTimeout(result *coreexecutor.StreamResult, cancel con
 		}
 		sendTimeout := func() {
 			if err := CompactTimeoutErrorIfDeadline(state); err != nil {
-				// Blocking send: consumer must observe the terminal error.
-				// If they already abandoned the stream, this returns when out closes
-				// is not possible before close; use select with ctx only for parent cancel
-				// without compact fire — still try once.
+				// Keep the terminal error queued until a consumer takes it.
+				// Prefer not to drop on arbitrary wall-clock; only abandon if
+				// the parent request context is already gone and nobody is reading.
 				select {
 				case out <- coreexecutor.StreamChunk{Err: err}:
-				case <-time.After(5 * time.Second):
-					// Best-effort: avoid leaking this goroutine forever if nobody reads.
+				case <-ctx.Done():
+					// Compact timer already fired; still try once more non-blocking.
+					select {
+					case out <- coreexecutor.StreamChunk{Err: err}:
+					default:
+					}
 				}
 			}
 		}

@@ -1100,8 +1100,13 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 	applyStreamHeaders := func(headers http.Header) {
 		rawStreamHeaders = finalInterceptorHeaders(rawStreamHeaders, headers)
 	}
+	// Bound interceptor work by the compact attempt context when armed.
+	interceptorCtx := streamCtx
+	if interceptorCtx == nil {
+		interceptorCtx = ctx
+	}
 	if streamInterceptorsActive {
-		intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+		intercepted := interceptStreamChunk(interceptorCtx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
 			SourceFormat:    responseProtocol,
 			Model:           modelName,
 			RequestedModel:  originalRequestedModel,
@@ -1137,6 +1142,8 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		chunkIndex := 0
 		var historyChunks [][]byte
 		for {
+			// Consume chunks with parent ctx so compact timeout errors remain readable
+			// after streamCtx cancels.
 			chunk, ok, canceled := nextStreamChunk(ctx, nil, nil, chunks)
 			if canceled {
 				return
@@ -1156,7 +1163,7 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 			}
 			payload := cloneBytes(chunk.Payload)
 			if streamInterceptorsActive {
-				intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+				intercepted := interceptStreamChunk(interceptorCtx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
 					SourceFormat:    responseProtocol,
 					Model:           modelName,
 					RequestedModel:  originalRequestedModel,
