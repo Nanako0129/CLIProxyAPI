@@ -1054,21 +1054,40 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		return nil, nil, errChan
 	}
 	req, opts := h.pluginExecutorRequest(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, true, execOptions)
-	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
-	req, opts = h.applyRequestInterceptorsAfterPluginExecutorRoute(ctx, host, executorPluginID, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
-	streamResult, errStream := host.ExecutePluginExecutorStream(ctx, executorPluginID, req, opts)
+	streamCtx, compactCancel, compactState, meta := armCompactStreamGuard(h.Cfg, opts.Headers, ctx, opts.Metadata)
+	opts.Metadata = meta
+	req, opts = h.applyRequestInterceptorsBeforeAuth(streamCtx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
+	req, opts = h.applyRequestInterceptorsAfterPluginExecutorRoute(streamCtx, host, executorPluginID, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
+	streamResult, errStream := host.ExecutePluginExecutorStream(streamCtx, executorPluginID, req, opts)
 	if errStream != nil {
+		if compactCancel != nil {
+			compactCancel()
+		}
+		if timeoutErr := CompactTimeoutErrorIfDeadline(compactState); timeoutErr != nil {
+			errStream = timeoutErr
+		}
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- executionErrorMessage(errStream)
 		close(errChan)
 		return nil, nil, errChan
 	}
 	if streamResult == nil {
+		if compactCancel != nil {
+			compactCancel()
+		}
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor returned nil stream")}
 		close(errChan)
 		return nil, nil, errChan
 	}
+	if compactCancel != nil && streamResult.Chunks != nil {
+		streamResult = releaseCompactAbsoluteTimeout(streamResult, compactCancel, streamCtx, compactState)
+		compactCancel = nil
+	} else if compactCancel != nil {
+		compactCancel()
+	}
+	// Use streamCtx for consumer cancellation so compact deadlines surface downstream.
+	ctx = streamCtx
 
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	interceptorHost := h.interceptorHost()
@@ -1200,6 +1219,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	if routeDecision.ExecutorPluginID != "" {
 		return h.streamWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
 	}
+	// Note: plugin path arms compact guard inside streamWithPluginExecutor.
 	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision, execOptions)
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -1240,19 +1260,8 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	opts.Metadata = reqMeta
 	// Compact class guard (header + streaming.compact.enabled): disable stream
 	// retries and arm absolute wall-clock. Never rewrite model/effort/thinking.
-	streamCtx := ctx
-	var compactCancel context.CancelFunc
-	var compactDuration time.Duration
-	if CompactGuardActive(h.Cfg, opts.Headers) {
-		if opts.Metadata == nil {
-			opts.Metadata = make(map[string]any)
-		}
-		opts.Metadata[coreexecutor.DisableStreamRetriesMetadataKey] = true
-		compactDuration = StreamingCompactMaxDuration(h.Cfg)
-		if compactDuration > 0 {
-			streamCtx, compactCancel = WithCompactAbsoluteTimeout(ctx, compactDuration)
-		}
-	}
+	streamCtx, compactCancel, compactState, reqMeta := armCompactStreamGuard(h.Cfg, opts.Headers, ctx, opts.Metadata)
+	opts.Metadata = reqMeta
 	req, opts = h.applyRequestInterceptorsBeforeAuth(streamCtx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
 	maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
 	if h.AuthManager.HomeEnabled() {
@@ -1267,13 +1276,12 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		if compactCancel != nil {
 			compactCancel()
 		}
-		if timeoutErr := CompactTimeoutErrorIfDeadline(streamCtx, compactDuration); timeoutErr != nil {
+		if timeoutErr := CompactTimeoutErrorIfDeadline(compactState); timeoutErr != nil {
 			err = timeoutErr
 		}
 	} else if compactCancel != nil && streamResult != nil && streamResult.Chunks != nil {
 		// Keep the absolute deadline armed for the lifetime of the chunk channel.
-		// Cancel only after the consumer stops reading (release helper).
-		streamResult = releaseCompactAbsoluteTimeout(streamResult, compactCancel, streamCtx, compactDuration)
+		streamResult = releaseCompactAbsoluteTimeout(streamResult, compactCancel, streamCtx, compactState)
 		compactCancel = nil
 	} else if compactCancel != nil {
 		compactCancel()

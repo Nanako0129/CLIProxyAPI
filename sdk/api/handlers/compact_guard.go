@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -66,33 +67,71 @@ func StreamingCompactMaxDuration(cfg *config.SDKConfig) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-// WithCompactAbsoluteTimeout wraps ctx with an absolute deadline when duration > 0.
-// The timer does not reset on payload activity.
-func WithCompactAbsoluteTimeout(parent context.Context, duration time.Duration) (context.Context, context.CancelFunc) {
+// compactTimeoutState tracks whether the compact absolute timer itself fired,
+// distinct from parent-context deadlines.
+type compactTimeoutState struct {
+	duration time.Duration
+	fired    chan struct{}
+	once     sync.Once
+}
+
+func (s *compactTimeoutState) markFired() {
+	if s == nil {
+		return
+	}
+	s.once.Do(func() { close(s.fired) })
+}
+
+func (s *compactTimeoutState) errorIfFired() error {
+	if s == nil || s.duration <= 0 {
+		return nil
+	}
+	select {
+	case <-s.fired:
+		return &streamCompactTimeoutError{timeout: s.duration}
+	default:
+		return nil
+	}
+}
+
+// WithCompactAbsoluteTimeout cancels ctx after duration using an independent timer.
+// Parent deadlines cancel the context without being reported as compact timeouts.
+func WithCompactAbsoluteTimeout(parent context.Context, duration time.Duration) (context.Context, context.CancelFunc, *compactTimeoutState) {
 	if parent == nil {
 		parent = context.Background()
 	}
 	if duration <= 0 {
-		return context.WithCancel(parent)
+		ctx, cancel := context.WithCancel(parent)
+		return ctx, cancel, nil
 	}
-	return context.WithTimeout(parent, duration)
+	state := &compactTimeoutState{
+		duration: duration,
+		fired:    make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(parent)
+	timer := time.AfterFunc(duration, func() {
+		state.markFired()
+		cancel()
+	})
+	stop := func() {
+		timer.Stop()
+		cancel()
+	}
+	return ctx, stop, state
 }
 
-// CompactTimeoutErrorIfDeadline returns a streamCompactTimeoutError when ctx ended
-// because of the compact absolute deadline (DeadlineExceeded only).
-func CompactTimeoutErrorIfDeadline(ctx context.Context, duration time.Duration) error {
-	if duration <= 0 || ctx == nil {
+// CompactTimeoutErrorIfDeadline returns a streamCompactTimeoutError only when
+// the compact absolute timer fired (not when a parent deadline expires).
+func CompactTimeoutErrorIfDeadline(state *compactTimeoutState) error {
+	if state == nil {
 		return nil
 	}
-	if ctx.Err() == context.DeadlineExceeded {
-		return &streamCompactTimeoutError{timeout: duration}
-	}
-	return nil
+	return state.errorIfFired()
 }
 
 // releaseCompactAbsoluteTimeout keeps the absolute deadline armed while chunks
-// are consumed and surfaces a gateway-timeout error when the deadline fires.
-func releaseCompactAbsoluteTimeout(result *coreexecutor.StreamResult, cancel context.CancelFunc, ctx context.Context, duration time.Duration) *coreexecutor.StreamResult {
+// are consumed and surfaces a gateway-timeout error when the compact timer fires.
+func releaseCompactAbsoluteTimeout(result *coreexecutor.StreamResult, cancel context.CancelFunc, ctx context.Context, state *compactTimeoutState) *coreexecutor.StreamResult {
 	if result == nil || result.Chunks == nil {
 		if cancel != nil {
 			cancel()
@@ -100,22 +139,32 @@ func releaseCompactAbsoluteTimeout(result *coreexecutor.StreamResult, cancel con
 		return result
 	}
 	remaining := result.Chunks
-	out := make(chan coreexecutor.StreamChunk)
+	// Buffer one chunk so a terminal compact timeout error is not dropped when
+	// the consumer is briefly busy forwarding a previous payload.
+	out := make(chan coreexecutor.StreamChunk, 1)
 	result.Chunks = out
 	go func() {
 		defer close(out)
 		if cancel != nil {
 			defer cancel()
 		}
+		sendTimeout := func() {
+			if err := CompactTimeoutErrorIfDeadline(state); err != nil {
+				// Blocking send: consumer must observe the terminal error.
+				// If they already abandoned the stream, this returns when out closes
+				// is not possible before close; use select with ctx only for parent cancel
+				// without compact fire — still try once.
+				select {
+				case out <- coreexecutor.StreamChunk{Err: err}:
+				case <-time.After(5 * time.Second):
+					// Best-effort: avoid leaking this goroutine forever if nobody reads.
+				}
+			}
+		}
 		for {
 			select {
 			case <-ctx.Done():
-				if err := CompactTimeoutErrorIfDeadline(ctx, duration); err != nil {
-					select {
-					case out <- coreexecutor.StreamChunk{Err: err}:
-					default:
-					}
-				}
+				sendTimeout()
 				return
 			case chunk, ok := <-remaining:
 				if !ok {
@@ -123,12 +172,7 @@ func releaseCompactAbsoluteTimeout(result *coreexecutor.StreamResult, cancel con
 				}
 				select {
 				case <-ctx.Done():
-					if err := CompactTimeoutErrorIfDeadline(ctx, duration); err != nil {
-						select {
-						case out <- coreexecutor.StreamChunk{Err: err}:
-						default:
-						}
-					}
+					sendTimeout()
 					return
 				case out <- chunk:
 				}
@@ -136,4 +180,22 @@ func releaseCompactAbsoluteTimeout(result *coreexecutor.StreamResult, cancel con
 		}
 	}()
 	return result
+}
+
+// armCompactStreamGuard prepares compact no-retry metadata and optional absolute
+// wall-clock for a stream attempt. Returns the context to use for execution.
+func armCompactStreamGuard(cfg *config.SDKConfig, headers http.Header, parent context.Context, meta map[string]any) (context.Context, context.CancelFunc, *compactTimeoutState, map[string]any) {
+	if !CompactGuardActive(cfg, headers) {
+		return parent, nil, nil, meta
+	}
+	if meta == nil {
+		meta = make(map[string]any)
+	}
+	meta[coreexecutor.DisableStreamRetriesMetadataKey] = true
+	duration := StreamingCompactMaxDuration(cfg)
+	if duration <= 0 {
+		return parent, nil, nil, meta
+	}
+	ctx, cancel, state := WithCompactAbsoluteTimeout(parent, duration)
+	return ctx, cancel, state, meta
 }

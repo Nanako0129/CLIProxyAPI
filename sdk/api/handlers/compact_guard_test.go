@@ -47,14 +47,14 @@ func TestStreamingCompactMaxDurationBounds(t *testing.T) {
 }
 
 func TestCompactAbsoluteTimeoutFires(t *testing.T) {
-	ctx, cancel := WithCompactAbsoluteTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel, state := WithCompactAbsoluteTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	select {
 	case <-ctx.Done():
 	case <-time.After(time.Second):
 		t.Fatal("absolute timeout did not fire")
 	}
-	err := CompactTimeoutErrorIfDeadline(ctx, 50*time.Millisecond)
+	err := CompactTimeoutErrorIfDeadline(state)
 	if err == nil {
 		t.Fatal("expected compact timeout error")
 	}
@@ -64,6 +64,21 @@ func TestCompactAbsoluteTimeoutFires(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "compact request exceeded") {
 		t.Fatalf("error message = %q", err.Error())
+	}
+}
+
+func TestCompactTimeoutIgnoresParentDeadline(t *testing.T) {
+	parent, parentCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer parentCancel()
+	ctx, cancel, state := WithCompactAbsoluteTimeout(parent, 5*time.Second)
+	defer cancel()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("parent deadline did not cancel child")
+	}
+	if err := CompactTimeoutErrorIfDeadline(state); err != nil {
+		t.Fatalf("parent deadline must not report compact timeout: %v", err)
 	}
 }
 
