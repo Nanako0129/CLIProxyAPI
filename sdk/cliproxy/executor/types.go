@@ -35,6 +35,11 @@ const GenerateMetadataKey = "generate"
 // the supported single-credential active-turn topology.
 const CodexActiveTurnBridgeMetadataKey = "codex_active_turn_bridge_ready"
 
+// DisableStreamRetriesMetadataKey disables auth-manager stream outer retries and
+// multi-credential rotation for a single ExecuteStream call when set to true.
+// Used by remora compact guards; must not be set for ordinary client traffic.
+const DisableStreamRetriesMetadataKey = "disable_stream_retries"
+
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"

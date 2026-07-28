@@ -11,6 +11,10 @@ type SDKConfig = internalconfig.SDKConfig
 type Config = internalconfig.Config
 
 type StreamingConfig = internalconfig.StreamingConfig
+
+// StreamingCompactConfig is the multi-provider compact class guard config
+// (timeout + no-retry only; no product body rewrite).
+type StreamingCompactConfig = internalconfig.StreamingCompactConfig
 type TLSConfig = internalconfig.TLSConfig
 type RemoteManagement = internalconfig.RemoteManagement
 type OAuthModelAlias = internalconfig.OAuthModelAlias

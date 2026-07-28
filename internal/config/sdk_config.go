@@ -75,4 +75,21 @@ type StreamingConfig struct {
 	// A timed-out attempt is canceled and may consume one BootstrapRetries retry.
 	// <= 0 disables the timeout. Values above 600 are capped at 600 seconds.
 	BootstrapTimeoutSeconds int `yaml:"bootstrap-timeout-seconds,omitempty" json:"bootstrap-timeout-seconds,omitempty"`
+
+	// Compact configures header-gated guards for Claude Code compact requests.
+	// Disabled by default (fail-closed): header alone never activates the guard.
+	Compact StreamingCompactConfig `yaml:"compact,omitempty" json:"compact,omitempty"`
+}
+
+// StreamingCompactConfig is a multi-provider gateway guard for requests marked
+// X-Calico-Request-Source: compact. It never rewrites product policy fields
+// (model/effort/thinking); those belong to the client (e.g. remora/calico).
+// See AGENTS.md for the intentional absolute wall-clock exception.
+type StreamingCompactConfig struct {
+	// Enabled is the master switch. When false (default), compact guards never apply.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+
+	// MaxDurationSeconds is an absolute wall-clock limit for one compact attempt.
+	// Armed only when Enabled and > 0. Values above 600 are capped at 600 seconds.
+	MaxDurationSeconds int `yaml:"max-duration-seconds,omitempty" json:"max-duration-seconds,omitempty"`
 }

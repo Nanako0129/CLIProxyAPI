@@ -2664,6 +2664,10 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	}
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
+	if disableStreamRetriesFromOptions(opts) {
+		// Compact / single-shot stream guards: one outer attempt, one credential.
+		maxRetryCredentials = 1
+	}
 
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
@@ -2673,6 +2677,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 			return result, nil
 		}
 		lastErr = errStream
+		if disableStreamRetriesFromOptions(opts) {
+			break
+		}
 		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, normalized, retryModel, maxWait)
 		if !shouldRetry {
 			break
@@ -2682,7 +2689,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		}
 	}
 	if lastErr != nil {
-		if hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
+		if !disableStreamRetriesFromOptions(opts) && hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
 			if result, ok, errCredits := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); errCredits != nil {
 				return nil, errCredits
 			} else if ok {
@@ -2696,6 +2703,24 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		return nil, lastErr
 	}
 	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+}
+
+func disableStreamRetriesFromOptions(opts cliproxyexecutor.Options) bool {
+	if opts.Metadata == nil {
+		return false
+	}
+	value, ok := opts.Metadata[cliproxyexecutor.DisableStreamRetriesMetadataKey]
+	if !ok || value == nil {
+		return false
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "true") || strings.TrimSpace(typed) == "1"
+	default:
+		return false
+	}
 }
 
 func (m *Manager) executeHome(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, countTokens bool) (cliproxyexecutor.Response, error) {

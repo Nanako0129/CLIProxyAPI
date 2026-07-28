@@ -277,6 +277,24 @@ func PassthroughHeadersEnabled(cfg *config.SDKConfig) bool {
 	return cfg != nil && cfg.PassthroughHeaders
 }
 
+func disableStreamRetriesFromMetadata(meta map[string]any) bool {
+	if meta == nil {
+		return false
+	}
+	value, ok := meta[coreexecutor.DisableStreamRetriesMetadataKey]
+	if !ok || value == nil {
+		return false
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "true") || strings.TrimSpace(typed) == "1"
+	default:
+		return false
+	}
+}
+
 func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Idempotency-Key is an optional client-supplied header used to correlate retries.
 	// Only include it if the client explicitly provides it.
@@ -1220,12 +1238,46 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		RequestAfterAuthInterceptor: h.requestAfterAuthInterceptor(afterAuthCapture, execOptions.SkipInterceptorPluginID),
 	}
 	opts.Metadata = reqMeta
-	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
+	// Compact class guard (header + streaming.compact.enabled): disable stream
+	// retries and arm absolute wall-clock. Never rewrite model/effort/thinking.
+	streamCtx := ctx
+	var compactCancel context.CancelFunc
+	var compactDuration time.Duration
+	if CompactGuardActive(h.Cfg, opts.Headers) {
+		if opts.Metadata == nil {
+			opts.Metadata = make(map[string]any)
+		}
+		opts.Metadata[coreexecutor.DisableStreamRetriesMetadataKey] = true
+		compactDuration = StreamingCompactMaxDuration(h.Cfg)
+		if compactDuration > 0 {
+			streamCtx, compactCancel = WithCompactAbsoluteTimeout(ctx, compactDuration)
+		}
+	}
+	req, opts = h.applyRequestInterceptorsBeforeAuth(streamCtx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
 	maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
 	if h.AuthManager.HomeEnabled() {
 		maxBootstrapRetries = 0
 	}
-	streamResult, bootstrapRetriesUsed, err := h.executeInitialStreamWithBootstrapTimeout(ctx, providers, req, opts, maxBootstrapRetries)
+	// Compact guard: single attempt only (bootstrap + auth stream retries).
+	if disableStreamRetriesFromMetadata(opts.Metadata) {
+		maxBootstrapRetries = 0
+	}
+	streamResult, bootstrapRetriesUsed, err := h.executeInitialStreamWithBootstrapTimeout(streamCtx, providers, req, opts, maxBootstrapRetries)
+	if err != nil {
+		if compactCancel != nil {
+			compactCancel()
+		}
+		if timeoutErr := CompactTimeoutErrorIfDeadline(streamCtx, compactDuration); timeoutErr != nil {
+			err = timeoutErr
+		}
+	} else if compactCancel != nil && streamResult != nil && streamResult.Chunks != nil {
+		// Keep the absolute deadline armed for the lifetime of the chunk channel.
+		// Cancel only after the consumer stops reading (release helper).
+		streamResult = releaseCompactAbsoluteTimeout(streamResult, compactCancel, streamCtx, compactDuration)
+		compactCancel = nil
+	} else if compactCancel != nil {
+		compactCancel()
+	}
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
