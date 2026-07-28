@@ -260,9 +260,11 @@ nonstream-keepalive-interval: 0
 #   bootstrap-timeout-seconds: 20  # Default: 0 (disabled). Max wait for the first upstream payload; capped at 600.
 #   # Compact class guard: only when enabled=true AND X-Calico-Request-Source: compact.
 #   # Does not rewrite model/effort/thinking (client/product policy owns those).
+#   # Recommended max-duration-seconds: 600 for remora/calico long sessions
+#   # (successful auto-compacts often take 2–5 minutes wall-clock; 90s mis-kills them).
 #   compact:
 #     enabled: false
-#     max-duration-seconds: 90     # Absolute wall-clock per attempt; 0 disables timer; capped at 600.
+#     max-duration-seconds: 600    # Absolute wall-clock per attempt; 0 disables timer; capped at 600.
 
 # Signature cache validation for thinking blocks (Antigravity/Claude).
 # When true (default), cached signatures are preferred and validated.
