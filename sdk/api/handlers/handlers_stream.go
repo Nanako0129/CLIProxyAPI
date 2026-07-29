@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -12,6 +13,24 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"golang.org/x/net/context"
 )
+
+func disableStreamRetriesFromMetadata(meta map[string]any) bool {
+	if meta == nil {
+		return false
+	}
+	value, ok := meta[coreexecutor.DisableStreamRetriesMetadataKey]
+	if !ok || value == nil {
+		return false
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "true") || strings.TrimSpace(typed) == "1"
+	default:
+		return false
+	}
+}
 
 // ExecuteStreamWithAuthManager executes a streaming request via the core auth manager.
 // This path is the only supported execution route.
@@ -40,32 +59,56 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 		return nil, nil, errChan
 	}
 	req, opts := h.pluginExecutorRequest(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, true, execOptions)
-	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
-	req, opts = h.applyRequestInterceptorsAfterPluginExecutorRoute(ctx, host, executorPluginID, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
-	streamResult, errStream := host.ExecutePluginExecutorStream(ctx, executorPluginID, req, opts)
+	streamCtx, compactCancel, compactState, meta := armCompactStreamGuard(h.Cfg, opts.Headers, ctx, opts.Metadata)
+	opts.Metadata = meta
+	req, opts = h.applyRequestInterceptorsBeforeAuth(streamCtx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
+	req, opts = h.applyRequestInterceptorsAfterPluginExecutorRoute(streamCtx, host, executorPluginID, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
+	streamResult, errStream := host.ExecutePluginExecutorStream(streamCtx, executorPluginID, req, opts)
 	if errStream != nil {
+		if compactCancel != nil {
+			compactCancel()
+		}
+		if timeoutErr := CompactTimeoutErrorIfDeadline(compactState); timeoutErr != nil {
+			errStream = timeoutErr
+		}
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- executionErrorMessage(errStream)
 		close(errChan)
 		return nil, nil, errChan
 	}
 	if streamResult == nil {
+		if compactCancel != nil {
+			compactCancel()
+		}
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("plugin executor returned nil stream")}
 		close(errChan)
 		return nil, nil, errChan
 	}
+	if compactCancel != nil && streamResult.Chunks != nil {
+		// Keep the parent ctx for the consumer loop so a compact timeout chunk
+		// can be read after streamCtx cancels (releaseCompactAbsoluteTimeout
+		// still uses streamCtx for the producer side).
+		streamResult = releaseCompactAbsoluteTimeout(streamResult, compactCancel, streamCtx, ctx, compactState)
+	} else if compactCancel != nil {
+		compactCancel()
+	}
 
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	interceptorHost := h.interceptorHost()
 	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
+	// Bound interceptor work by the compact attempt context when armed.
+	interceptorCtx := streamCtx
+	if interceptorCtx == nil {
+		interceptorCtx = ctx
+	}
 	rawStreamHeaders := cloneHeader(streamResult.Headers)
 	baseStreamHeaders := cloneHeader(streamResult.Headers)
 	applyStreamHeaders := func(headers http.Header) {
 		rawStreamHeaders = finalInterceptorHeaders(rawStreamHeaders, headers)
 	}
 	if streamInterceptorsActive {
-		intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+		intercepted := interceptStreamChunk(interceptorCtx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
 			SourceFormat:    responseProtocol,
 			Model:           modelName,
 			RequestedModel:  originalRequestedModel,
@@ -98,9 +141,14 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 	go func() {
 		defer close(dataChan)
 		defer close(errChan)
+		if compactCancel != nil {
+			defer compactCancel()
+		}
 		chunkIndex := 0
 		var historyChunks [][]byte
 		for {
+			// Consume chunks with parent ctx so compact timeout errors remain readable
+			// after streamCtx cancels.
 			chunk, ok, canceled := nextStreamChunk(ctx, nil, nil, chunks)
 			if canceled {
 				return
@@ -120,7 +168,7 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 			}
 			payload := cloneBytes(chunk.Payload)
 			if streamInterceptorsActive {
-				intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+				intercepted := interceptStreamChunk(interceptorCtx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
 					SourceFormat:    responseProtocol,
 					Model:           modelName,
 					RequestedModel:  originalRequestedModel,
@@ -224,12 +272,33 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		RequestAfterAuthInterceptor: h.requestAfterAuthInterceptor(afterAuthCapture, execOptions.SkipInterceptorPluginID),
 	}
 	opts.Metadata = reqMeta
-	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
+	// Compact class guard (header + streaming.compact.enabled): disable stream
+	// retries and arm absolute wall-clock. Never rewrite model/effort/thinking.
+	streamCtx, compactCancel, compactState, reqMeta := armCompactStreamGuard(h.Cfg, opts.Headers, ctx, opts.Metadata)
+	opts.Metadata = reqMeta
+	req, opts = h.applyRequestInterceptorsBeforeAuth(streamCtx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
 	maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
 	if h.AuthManager.HomeEnabled() {
 		maxBootstrapRetries = 0
 	}
-	streamResult, bootstrapRetriesUsed, err := h.executeInitialStreamWithBootstrapTimeout(ctx, providers, req, opts, maxBootstrapRetries)
+	// Compact guard: single attempt only (bootstrap + auth stream retries).
+	if disableStreamRetriesFromMetadata(opts.Metadata) {
+		maxBootstrapRetries = 0
+	}
+	streamResult, bootstrapRetriesUsed, err := h.executeInitialStreamWithBootstrapTimeout(streamCtx, providers, req, opts, maxBootstrapRetries)
+	if err != nil {
+		if compactCancel != nil {
+			compactCancel()
+		}
+		if timeoutErr := CompactTimeoutErrorIfDeadline(compactState); timeoutErr != nil {
+			err = timeoutErr
+		}
+	} else if compactCancel != nil && streamResult != nil && streamResult.Chunks != nil {
+		// Keep the absolute deadline armed for the lifetime of the chunk channel.
+		streamResult = releaseCompactAbsoluteTimeout(streamResult, compactCancel, streamCtx, ctx, compactState)
+	} else if compactCancel != nil {
+		compactCancel()
+	}
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -261,6 +330,11 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	interceptorHost := h.interceptorHost()
 	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
+	// Bound interceptor work by the compact attempt context when armed.
+	interceptorCtx := streamCtx
+	if interceptorCtx == nil {
+		interceptorCtx = ctx
+	}
 	// Resolve bootstrap retries and header initialization before returning so the
 	// returned header snapshot is never modified by the stream goroutine.
 	rawStreamHeaders := cloneHeader(streamResult.Headers)
@@ -284,7 +358,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 			return
 		}
 		executedReq, executedOpts := executedRequest()
-		intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+		intercepted := interceptStreamChunk(interceptorCtx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
 			SourceFormat:    responseProtocol,
 			Model:           normalizedModel,
 			RequestedModel:  originalRequestedModel,
@@ -304,7 +378,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		payload = cloneBytes(payload)
 		if streamInterceptorsActive {
 			executedReq, executedOpts := executedRequest()
-			intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
+			intercepted := interceptStreamChunk(interceptorCtx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
 				SourceFormat:    responseProtocol,
 				Model:           normalizedModel,
 				RequestedModel:  originalRequestedModel,
@@ -418,7 +492,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 			break
 		}
 		bootstrapRetriesUsed++
-		retryResult, retryErr := h.executeStreamBootstrapAttempt(ctx, providers, req, opts)
+		retryResult, retryErr := h.executeStreamBootstrapAttempt(streamCtx, providers, req, opts)
 		if retryErr != nil {
 			bootstrapErr = executionErrorMessage(enrichAuthSelectionError(retryErr, providers, normalizedModel))
 			break
@@ -454,6 +528,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	go func() {
 		defer close(dataChan)
 		defer close(errChan)
+		if compactCancel != nil {
+			defer compactCancel()
+		}
 		if streamCanceledBeforeRead {
 			return
 		}

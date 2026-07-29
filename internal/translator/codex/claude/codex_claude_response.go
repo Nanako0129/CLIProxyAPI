@@ -102,7 +102,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		// output_item.done carries that item's final encrypted_content. Keep one
 		// thinking block open for the whole item and separate the parts with a blank
 		// line, so the only signature ever emitted is the final one.
-		if params.ThinkingBlockOpen {
+		if params.ThinkingBlockOpen && params.ThinkingSummarySeen {
 			output = append(output, appendCodexThinkingDelta(params, codexThinkingSummaryPartSeparator)...)
 		} else {
 			output = append(output, startCodexThinkingBlock(params)...)
@@ -185,6 +185,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			// Kept only as a fallback for streams whose output_item.done omits
 			// encrypted_content; it is a pre-content snapshot, never the final value.
 			params.ThinkingSignature = itemResult.Get("encrypted_content").String()
+			output = append(output, startCodexThinkingBlock(params)...)
 		case "web_search_call":
 			// Defer server_tool_use until output_item.done carries action/query.
 		}

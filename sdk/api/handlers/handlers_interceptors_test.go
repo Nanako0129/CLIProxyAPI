@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
@@ -23,6 +24,52 @@ type handlerInterceptorTestHost struct {
 	interceptRequestAfterAuth  func(context.Context, pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse
 	interceptResponse          func(context.Context, pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse
 	interceptStreamChunk       func(context.Context, pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse
+}
+
+func TestCompactStreamKeepsContextThroughFinalChunkInterceptor(t *testing.T) {
+	model := "handler-interceptor-compact-final-model"
+	executor := &interceptorCaptureExecutor{
+		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			chunks := make(chan coreexecutor.StreamChunk, 1)
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("final")}
+			close(chunks)
+			return &coreexecutor.StreamResult{Chunks: chunks}, nil
+		},
+	}
+	cfg := &sdkconfig.SDKConfig{Streaming: sdkconfig.StreamingConfig{Compact: sdkconfig.StreamingCompactConfig{
+		Enabled:            true,
+		MaxDurationSeconds: 60,
+	}}}
+	handler := newInterceptorHandler(t, model, executor, cfg)
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
+			if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
+				return pluginapi.StreamChunkInterceptResponse{}
+			}
+			select {
+			case <-ctx.Done():
+				return pluginapi.StreamChunkInterceptResponse{Body: []byte("canceled")}
+			case <-time.After(20 * time.Millisecond):
+				return pluginapi.StreamChunkInterceptResponse{Body: append(req.Body, []byte("|intercepted")...)}
+			}
+		},
+	})
+	headers := http.Header{}
+	headers.Set(CalicoRequestSourceHeader, CalicoRequestSourceCompact)
+	data, _, errs := handler.ExecuteStreamWithAuthManager(contextWithHeaders(headers), "openai", model, []byte(fmt.Sprintf(`{"model":%q}`, model)), "")
+
+	var got []byte
+	for chunk := range data {
+		got = append(got, chunk...)
+	}
+	for msg := range errs {
+		if msg != nil {
+			t.Fatalf("unexpected stream error: %+v", msg)
+		}
+	}
+	if string(got) != "final|intercepted" {
+		t.Fatalf("stream payload = %q, want final interceptor output", got)
+	}
 }
 
 type handlerInterceptorNoStreamTestHost struct {

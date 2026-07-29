@@ -113,6 +113,10 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	}
 
 	_, maxRetryCredentials, maxWait := m.retrySettings()
+	if disableStreamRetriesFromOptions(opts) {
+		// Compact / single-shot stream guards: one outer attempt, one credential.
+		maxRetryCredentials = 1
+	}
 
 	var lastErr error
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
@@ -122,6 +126,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 			return result, nil
 		}
 		lastErr = errStream
+		if disableStreamRetriesFromOptions(opts) {
+			break
+		}
 		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, normalized, retryModel, maxWait)
 		if !shouldRetry {
 			break
@@ -131,7 +138,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		}
 	}
 	if lastErr != nil {
-		if hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
+		if !disableStreamRetriesFromOptions(opts) && hasAntigravityProvider(normalized) && shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
 			if result, ok, errCredits := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); errCredits != nil {
 				return nil, errCredits
 			} else if ok {
@@ -145,6 +152,24 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		return nil, lastErr
 	}
 	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+}
+
+func disableStreamRetriesFromOptions(opts cliproxyexecutor.Options) bool {
+	if opts.Metadata == nil {
+		return false
+	}
+	value, ok := opts.Metadata[cliproxyexecutor.DisableStreamRetriesMetadataKey]
+	if !ok || value == nil {
+		return false
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "true") || strings.TrimSpace(typed) == "1"
+	default:
+		return false
+	}
 }
 
 type requestToFormatResolver interface {
@@ -481,12 +506,15 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	executionModel, restoreExecutionModel := executionModelForAuthSelection(opts, req.Model)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	homeMode := m.HomeEnabled()
+	// Compact / single-shot guards must cap credentials even in Home mode, where
+	// the default path otherwise keeps rotating until exhaustion.
+	limitCredentials := !homeMode || disableStreamRetriesFromOptions(opts)
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
 	for {
-		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if limitCredentials && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
 				return nil, lastErr
 			}
@@ -599,7 +627,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			models = models[:1]
 			pooled = false
 		}
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, !homeMode, selection != nil)
+		// Compact single-shot also disables same-credential refresh retries and
+		// multi-model pool walk on the same credential.
+		allowInCredentialRetry := !homeMode && !disableStreamRetriesFromOptions(opts)
+		if disableStreamRetriesFromOptions(opts) && len(models) > 1 {
+			models = models[:1]
+			pooled = false
+		}
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, allowInCredentialRetry, selection != nil)
 		if errStream != nil {
 			if selection != nil {
 				releaseAttempt()
