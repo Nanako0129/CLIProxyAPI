@@ -698,6 +698,7 @@ func insertCodexReasoningReplayTurns(body []byte, replayItems [][]byte) ([]byte,
 	turns := splitCodexReasoningReplayTurns(replayItems)
 	insertions := make(map[int][][]byte)
 	usedAnchorIndexes := make(map[int]bool)
+	var inputPrefixFingerprints []string
 	fallbackAnchorEnd := len(inputItems) - 1
 	inserted := false
 	for turnIndex := len(turns) - 1; turnIndex >= 0; turnIndex-- {
@@ -717,7 +718,10 @@ func insertCodexReasoningReplayTurns(body []byte, replayItems [][]byte) ([]byte,
 			continue
 		}
 
-		anchorIndex, matched := codexReasoningReplayTurnAnchorIndex(inputItems, turn, fallbackAnchorEnd, usedAnchorIndexes)
+		if turn.requestFingerprint != "" && inputPrefixFingerprints == nil {
+			inputPrefixFingerprints = codexReplayInputPrefixFingerprints(inputItems)
+		}
+		anchorIndex, matched := codexReasoningReplayTurnAnchorIndex(inputItems, inputPrefixFingerprints, turn, fallbackAnchorEnd, usedAnchorIndexes)
 		if !matched {
 			continue
 		}
@@ -786,7 +790,7 @@ func splitCodexReasoningReplayTurns(items [][]byte) []codexReasoningReplayTurn {
 	return turns
 }
 
-func codexReasoningReplayTurnAnchorIndex(inputItems []gjson.Result, turn codexReasoningReplayTurn, fallbackEnd int, used map[int]bool) (int, bool) {
+func codexReasoningReplayTurnAnchorIndex(inputItems []gjson.Result, inputPrefixFingerprints []string, turn codexReasoningReplayTurn, fallbackEnd int, used map[int]bool) (int, bool) {
 	searchEnd := fallbackEnd
 	if turn.requestFingerprint != "" {
 		searchEnd = len(inputItems) - 1
@@ -795,7 +799,7 @@ func codexReasoningReplayTurnAnchorIndex(inputItems []gjson.Result, turn codexRe
 		searchEnd = len(inputItems) - 1
 	}
 	matchesRequestPrefix := func(index int) bool {
-		return turn.requestFingerprint == "" || codexReplayInputPrefixFingerprint(inputItems, index) == turn.requestFingerprint
+		return turn.requestFingerprint == "" || inputPrefixFingerprints[index] == turn.requestFingerprint
 	}
 	if len(turn.callIDs) > 0 {
 		callIDs := make(map[string]bool)
@@ -934,6 +938,18 @@ func codexReplayInputPrefixFingerprint(inputItems []gjson.Result, end int) strin
 		_, _ = hasher.Write([]byte(inputItems[index].Raw))
 	}
 	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+func codexReplayInputPrefixFingerprints(inputItems []gjson.Result) []string {
+	fingerprints := make([]string, len(inputItems)+1)
+	hasher := sha256.New()
+	fingerprints[0] = hex.EncodeToString(hasher.Sum(nil))
+	for index := range inputItems {
+		_, _ = hasher.Write([]byte("\x00item\x00"))
+		_, _ = hasher.Write([]byte(inputItems[index].Raw))
+		fingerprints[index+1] = hex.EncodeToString(hasher.Sum(nil))
+	}
+	return fingerprints
 }
 
 func filterCodexReasoningReplayItemsForInput(body []byte, items [][]byte) [][]byte {
@@ -1728,6 +1744,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}()
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
+		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
@@ -1782,7 +1799,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 
 			translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, identityState)
-			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, originalPayload, body, translatedLine, &param)
+			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, body, translatedLine, &param, claudeInputTokens)
 			if !downstreamCommitted && claudeStreamChunksCommitOutput(chunks) {
 				downstreamCommitted = true
 			}

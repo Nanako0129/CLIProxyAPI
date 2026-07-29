@@ -954,6 +954,20 @@ func TestCodexExecutorReasoningReplayCacheUsesRequestPrefixForDuplicateOutOfOrde
 	}
 }
 
+func TestCodexReplayInputPrefixFingerprintsMatchSinglePrefixHash(t *testing.T) {
+	inputItems := gjson.Parse(`[
+		{"type":"message","role":"user","content":"first"},
+		{"type":"message","role":"assistant","content":"second"},
+		{"type":"message","role":"user","content":"third"}
+	]`).Array()
+	fingerprints := codexReplayInputPrefixFingerprints(inputItems)
+	for end := 0; end <= len(inputItems); end++ {
+		if got, want := fingerprints[end], codexReplayInputPrefixFingerprint(inputItems, end); got != want {
+			t.Fatalf("fingerprint %d = %q, want %q", end, got, want)
+		}
+	}
+}
+
 func TestCodexExecutorReasoningReplayCacheDropsFunctionCallWithoutMatchingOutput(t *testing.T) {
 	internalcache.ClearCodexReasoningReplayCache()
 	t.Cleanup(internalcache.ClearCodexReasoningReplayCache)
