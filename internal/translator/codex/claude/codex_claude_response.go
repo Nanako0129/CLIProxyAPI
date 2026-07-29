@@ -179,6 +179,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		case "reasoning":
 			params.ThinkingSummarySeen = false
 			params.ThinkingSignature = itemResult.Get("encrypted_content").String()
+			output = append(output, startCodexThinkingBlock(params)...)
 		case "web_search_call":
 			// Defer server_tool_use until output_item.done carries action/query.
 		}
