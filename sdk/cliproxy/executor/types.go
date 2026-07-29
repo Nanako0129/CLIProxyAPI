@@ -27,6 +27,19 @@ const ReasoningEffortMetadataKey = "reasoning_effort"
 // ServiceTierMetadataKey stores the client-requested service tier for usage logs.
 const ServiceTierMetadataKey = "service_tier"
 
+// GenerateMetadataKey stores whether the client requested actual generation for usage logs.
+// Missing or true means generation is enabled; only an explicit false disables generation.
+const GenerateMetadataKey = "generate"
+
+// CodexActiveTurnBridgeMetadataKey is set only when the runtime has verified
+// the supported single-credential active-turn topology.
+const CodexActiveTurnBridgeMetadataKey = "codex_active_turn_bridge_ready"
+
+// DisableStreamRetriesMetadataKey disables auth-manager stream outer retries and
+// multi-credential rotation for a single ExecuteStream call when set to true.
+// Used by remora compact guards; must not be set for ordinary client traffic.
+const DisableStreamRetriesMetadataKey = "disable_stream_retries"
+
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
@@ -34,8 +47,16 @@ const (
 	SelectedAuthMetadataKey = "selected_auth_id"
 	// SelectedAuthCallbackMetadataKey carries an optional callback invoked with the selected auth ID.
 	SelectedAuthCallbackMetadataKey = "selected_auth_callback"
+	// SelectedAuthIndexMetadataKey stores the stable index of the auth selected by the scheduler.
+	SelectedAuthIndexMetadataKey = "selected_auth_index"
+	// SelectedAuthIndexCallbackMetadataKey carries an optional callback invoked with the selected auth index.
+	SelectedAuthIndexCallbackMetadataKey = "selected_auth_index_callback"
 	// ExecutionSessionMetadataKey identifies a long-lived downstream execution session.
 	ExecutionSessionMetadataKey = "execution_session_id"
+	// DerivedSessionIDMetadataKey stores a stable session identity inferred from request context.
+	DerivedSessionIDMetadataKey = "derived_session_id"
+	// CallerScopeMetadataKey isolates inferred session identities between downstream callers.
+	CallerScopeMetadataKey = "caller_scope"
 )
 
 // Request encapsulates the translated payload that will be sent to a provider executor.
@@ -104,6 +125,8 @@ type Options struct {
 	Metadata map[string]any
 	// RequestAfterAuthInterceptor runs after credential selection and before executor translation.
 	RequestAfterAuthInterceptor RequestAfterAuthInterceptor
+	// ExecutionLifecycle owns Home-dispatched execution resources. Executors must not add it to request metadata.
+	ExecutionLifecycle ExecutionLifecycle
 }
 
 // ResponseFormatOrSource returns the response target format for an execution.
@@ -128,6 +151,9 @@ type Response struct {
 type StreamChunk struct {
 	// Payload is the raw provider chunk payload.
 	Payload []byte
+	// Provisional marks output that may be discarded and retried before any
+	// externally meaningful response content has been emitted.
+	Provisional bool
 	// Err reports any terminal error encountered while producing chunks.
 	Err error
 }
@@ -147,4 +173,12 @@ type StreamResult struct {
 type StatusError interface {
 	error
 	StatusCode() int
+}
+
+// RequestScopedError identifies a failure tied to the current request rather
+// than the selected credential. Auth managers should not retry these errors
+// across credentials or change credential availability because of them.
+type RequestScopedError interface {
+	error
+	IsRequestScoped() bool
 }

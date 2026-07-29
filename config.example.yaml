@@ -49,6 +49,34 @@ pprof:
   enable: false
   addr: "127.0.0.1:8316"
 
+# Credential concurrency is configured by Home in Home mode. The synthesized Home config is
+# authoritative and local values, including the values below, are ignored. Do not use local
+# configuration to override a Home concurrency policy.
+# credential-concurrency:
+#   lifecycle-config-revision: 1
+#   observation-barrier-revision: 0
+#   cpa-heartbeat-timeout: "3s"
+#   cpa-cancel-bound: "5s"
+#   reclaim-grace: "5s"
+#   cleanup-interval: "5s"
+#   release-flush-interval: 250ms
+#   release-max-backoff: 2s
+#   busy-retry-min: 250ms
+#   busy-retry-max: 1s
+#   max-limit: 1000000
+
+# Credential in-flight observation snapshot contract.
+# credential-in-flight:
+#   snapshot-interval: 2s
+#   stale-after: 10s
+#   max-part-bytes: 262144
+#   max-part-count: 64
+#   max-revision-bytes: 16777216
+#   max-aggregate-groups: 100000
+#   max-details: 10000
+#   max-string-bytes: 256
+#   staging-retention: 1m
+
 # Standard dynamic library plugins are trusted in-process code. They are disabled by default.
 # Build Go examples with go build -buildmode=c-shared for the target GOOS/GOARCH.
 # Other languages can implement the same C ABI and JSON method protocol.
@@ -184,16 +212,65 @@ codex:
   # Some superstitious users believe request tracking identifiers can be used
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
+  # Experimental Claude-to-Codex active-turn bridge. Version 1 is advertised
+  # only with one local Codex credential and quota cooling disabled for it.
+  # Home mode and multi-credential routing intentionally fail closed.
+  active-turn-bridge: false
+  # When true, optimize Codex Desktop and codex-tui requests for multi-agent v2.
+  # This refreshes Codex spawn_agent model details, removes message parameter encryption,
+  # normalizes encrypted agent_message content for Codex, and converts agent_message input
+  # into standard user messages for non-Codex upstream protocols.
+  optimize-multi-agent-v2: false
+  # Terminate and relay Codex Live WebRTC audio and DataChannel traffic in this process.
+  # This requires inbound UDP reachability. Keep disabled to preserve direct media behavior.
+  live-media-relay:
+    enabled: false
+    # Maximum concurrent media sessions. Zero uses the default of 32.
+    max-sessions: 32
+    # Reject downstream SDP candidates that target private, loopback, link-local, or unspecified IPs.
+    # Keep false for local or trusted-network Codex Desktop connections.
+    disable-private-remote-ips: false
+    # Public IPv4 or IPv6 address advertised when CPA is behind 1:1 NAT.
+    public-ip: ""
+    # Optional UDP allocation range. Both values must be set together and provide at least two ports per session.
+    udp-port-min: 0
+    udp-port-max: 0
+    # Optional STUN/TURN servers. TURN credentials are never returned by the JSON config API.
+    # Without a concrete global/per-auth proxy-url, WebRTC uses normal direct ICE/STUN/TURN connectivity.
+    # With http, https, socks5, or socks5h proxy-url, the OpenAI-facing leg is forced through
+    # authenticated ICE-TCP over that proxy and never falls back to UDP or a direct connection.
+    # The Codex Desktop-facing leg remains direct, and configured ICE servers still apply to it.
+    # ice-servers:
+    #   - urls:
+    #       - "stun:stun.example.com:3478"
+    #   - urls:
+    #       - "turn:turn.example.com:3478?transport=udp"
+    #     username: "user"
+    #     credential: "secret"
+
+# xAI provider behavior.
+xai:
+  # When true, inject the native x_search tool when the request does not declare it.
+  # The injected tool is also added to tool_choice.allowed_tools when applicable.
+  inject-x-search: false
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true
 
 # When > 0, emit blank lines every N seconds for non-streaming responses to prevent idle timeouts.
 nonstream-keepalive-interval: 0
-# Streaming behavior (SSE keep-alives + safe bootstrap retries).
+# Streaming behavior (SSE keep-alives + safe bootstrap retries/timeouts).
 # streaming:
-#   keepalive-seconds: 15   # Default: 0 (disabled). <= 0 disables keep-alives.
-#   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
+#   keepalive-seconds: 15          # Default: 0 (disabled). <= 0 disables keep-alives.
+#   bootstrap-retries: 1           # Default: 0 (disabled). Retries before first byte is sent.
+#   bootstrap-timeout-seconds: 20  # Default: 0 (disabled). Max wait for the first upstream payload; capped at 600.
+#   # Compact class guard: only when enabled=true AND X-Calico-Request-Source: compact.
+#   # Does not rewrite model/effort/thinking (client/product policy owns those).
+#   # Recommended max-duration-seconds: 600 for remora/calico long sessions
+#   # (successful auto-compacts often take 2–5 minutes wall-clock; 90s mis-kills them).
+#   compact:
+#     enabled: false
+#     max-duration-seconds: 600    # Absolute wall-clock per attempt; 0 disables timer; capped at 600.
 
 # Signature cache validation for thinking blocks (Antigravity/Claude).
 # When true (default), cached signatures are preferred and validated.
@@ -264,6 +341,27 @@ nonstream-keepalive-interval: 0
 #       - "gpt-5-*"         # wildcard matching prefix (e.g. gpt-5-medium, gpt-5-codex)
 #       - "*-mini"          # wildcard matching suffix (e.g. gpt-5-codex-mini)
 #       - "*codex*"         # wildcard matching substring (e.g. gpt-5-codex-low)
+
+# xAI API keys
+# Uses the native xAI executor, including its Responses namespace-tool handling.
+# xai-api-key:
+#   - api-key: "xai-..."
+#     prefix: "xai" # optional: require calls like "xai/grok-4.5" to target this credential
+#     disable-cooling: false # optional: per-auth override for auth/model cooldown scheduling
+#     base-url: "https://api.x.ai/v1" # xAI-compatible Responses API endpoint
+#     websockets: true # optional: use the xAI upstream websocket transport for downstream websocket requests
+#     headers:
+#       X-Custom-Header: "custom-value"
+#     proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
+#     # proxy-url: "direct" # optional: explicit direct connect for this credential
+#     models:
+#       - name: "grok-4.5"       # upstream model name
+#         alias: "grok-latest"   # client alias mapped to the upstream model
+#         display-name: "Grok Latest" # optional catalog display name
+#         force-mapping: true     # optional: rewrite response model fields back to the alias
+#     excluded-models:
+#       - "grok-4.1"             # exclude specific models (exact match)
+#       - "grok-3-*"             # wildcard matching prefix
 
 # Claude API keys
 # claude-api-key:
@@ -384,14 +482,15 @@ nonstream-keepalive-interval: 0
 # Global OAuth model name aliases (per channel)
 # These aliases rename model IDs for both model listing and request routing.
 # Supported channels: vertex, aistudio, antigravity, claude, codex, kimi, xai.
-# NOTE: Aliases do not apply to gemini-api-key, interactions-api-key, codex-api-key, claude-api-key, openai-compatibility, or vertex-api-key.
+# NOTE: Aliases do not apply to gemini-api-key, interactions-api-key, codex-api-key, xai-api-key, claude-api-key, openai-compatibility, or vertex-api-key.
 # NOTE: Because aliases affect the merged /v1 model list and merged request routing, overlapping
 # client-visible names can become ambiguous across providers. For strict backend pinning, use
 # unique aliases/prefixes or avoid overlapping names.
 # You can repeat the same name with different aliases to expose multiple client model names.
-# Optional per-entry flags:
-#   fork: true          # keep the upstream model and also expose the alias as a separate client-visible model
-#   force-mapping: true # optional: rewrite upstream response model fields back to the client-visible alias (example below uses antigravity only)
+# Optional per-entry fields:
+#   fork: true                  # keep the upstream model and also expose the alias as a separate client-visible model
+#   display-name: "Model Name" # override the human-readable name shown in model catalogs
+#   force-mapping: true         # rewrite upstream response model fields back to the client-visible alias (example below uses antigravity only)
 # Per-auth OAuth aliases can also be stored in an OAuth auth JSON file as "model-aliases".
 # They apply only to that selected auth and take precedence over global aliases for the same client-visible alias.
 # Example auth JSON:
@@ -411,8 +510,9 @@ nonstream-keepalive-interval: 0
 #     - name: "gemini-2.5-pro"
 #       alias: "g2.5p"
 #   antigravity:
-#     - name: "gemini-pro-agent"          # upstream Antigravity model id
-#       alias: "gemini-3.1-pro-preview"   # client-visible id (Gemini 3.1 Pro Preview)
+#     - name: "gemini-pro-agent"                   # upstream Antigravity model id
+#       alias: "gemini-3.1-pro-preview"            # client-visible id (Gemini 3.1 Pro Preview)
+#       display-name: "Antigravity Gemini 3.1 Pro" # optional catalog display name
 #       fork: true
 #       force-mapping: true
 #   claude:

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
@@ -23,6 +24,52 @@ type handlerInterceptorTestHost struct {
 	interceptRequestAfterAuth  func(context.Context, pluginapi.RequestInterceptRequest) pluginapi.RequestInterceptResponse
 	interceptResponse          func(context.Context, pluginapi.ResponseInterceptRequest) pluginapi.ResponseInterceptResponse
 	interceptStreamChunk       func(context.Context, pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse
+}
+
+func TestCompactStreamKeepsContextThroughFinalChunkInterceptor(t *testing.T) {
+	model := "handler-interceptor-compact-final-model"
+	executor := &interceptorCaptureExecutor{
+		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			chunks := make(chan coreexecutor.StreamChunk, 1)
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("final")}
+			close(chunks)
+			return &coreexecutor.StreamResult{Chunks: chunks}, nil
+		},
+	}
+	cfg := &sdkconfig.SDKConfig{Streaming: sdkconfig.StreamingConfig{Compact: sdkconfig.StreamingCompactConfig{
+		Enabled:            true,
+		MaxDurationSeconds: 60,
+	}}}
+	handler := newInterceptorHandler(t, model, executor, cfg)
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
+			if req.ChunkIndex == pluginapi.StreamChunkHeaderInitIndex {
+				return pluginapi.StreamChunkInterceptResponse{}
+			}
+			select {
+			case <-ctx.Done():
+				return pluginapi.StreamChunkInterceptResponse{Body: []byte("canceled")}
+			case <-time.After(20 * time.Millisecond):
+				return pluginapi.StreamChunkInterceptResponse{Body: append(req.Body, []byte("|intercepted")...)}
+			}
+		},
+	})
+	headers := http.Header{}
+	headers.Set(CalicoRequestSourceHeader, CalicoRequestSourceCompact)
+	data, _, errs := handler.ExecuteStreamWithAuthManager(contextWithHeaders(headers), "openai", model, []byte(fmt.Sprintf(`{"model":%q}`, model)), "")
+
+	var got []byte
+	for chunk := range data {
+		got = append(got, chunk...)
+	}
+	for msg := range errs {
+		if msg != nil {
+			t.Fatalf("unexpected stream error: %+v", msg)
+		}
+	}
+	if string(got) != "final|intercepted" {
+		t.Fatalf("stream payload = %q, want final interceptor output", got)
+	}
 }
 
 type handlerInterceptorNoStreamTestHost struct {
@@ -840,7 +887,7 @@ func TestHandlerStreamInterceptorKeepsReturnedHeadersStableAfterFirstPayload(t *
 		t.Fatalf("first chunk = %q, want first", firstChunk)
 	}
 	if upstreamHeaders.Get("X-Chunk") != "first" || upstreamHeaders.Get("X-Stage") != "init" {
-		t.Fatalf("upstream headers after first chunk = %#v, want first chunk headers", upstreamHeaders)
+		t.Fatalf("upstream headers after first chunk = %#v, want first transformed chunk headers", upstreamHeaders)
 	}
 
 	close(releaseSecond)
@@ -857,7 +904,80 @@ func TestHandlerStreamInterceptorKeepsReturnedHeadersStableAfterFirstPayload(t *
 		t.Fatalf("stream payload = %q, want firstsecond", got)
 	}
 	if upstreamHeaders.Get("X-Chunk") != "first" {
-		t.Fatalf("upstream headers changed after first payload: %#v", upstreamHeaders)
+		t.Fatalf("upstream headers changed after return: %#v", upstreamHeaders)
+	}
+}
+
+func TestHandlerStreamInterceptorReturnedHeadersImmutableAfterReturn(t *testing.T) {
+	model := "handler-interceptor-stream-immutable-headers-model"
+	releaseSecond := make(chan struct{})
+	bodyStarted := make(chan struct{})
+	releaseBody := make(chan struct{})
+	executor := &interceptorCaptureExecutor{
+		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			chunks := make(chan coreexecutor.StreamChunk)
+			go func() {
+				defer close(chunks)
+				chunks <- coreexecutor.StreamChunk{Payload: []byte("first")}
+				<-releaseSecond
+				chunks <- coreexecutor.StreamChunk{Payload: []byte("second")}
+			}()
+			return &coreexecutor.StreamResult{
+				Headers: http.Header{"X-Upstream": []string{"stream"}},
+				Chunks:  chunks,
+			}, nil
+		},
+	}
+	handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{PassthroughHeaders: true})
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
+			headers := cloneHeader(req.ResponseHeaders)
+			switch req.ChunkIndex {
+			case pluginapi.StreamChunkHeaderInitIndex:
+				headers.Set("X-Init", "plugin")
+			case 1:
+				close(bodyStarted)
+				<-releaseBody
+				headers.Set("X-Body", "plugin")
+			}
+			return pluginapi.StreamChunkInterceptResponse{Headers: headers, Body: cloneBytes(req.Body)}
+		},
+	})
+
+	dataChan, upstreamHeaders, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", model, []byte(fmt.Sprintf(`{"model":%q}`, model)), "")
+	dataDone := make(chan struct{})
+	go func() {
+		defer close(dataDone)
+		for range dataChan {
+		}
+	}()
+	stopReading := make(chan struct{})
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			select {
+			case <-stopReading:
+				return
+			default:
+				_ = upstreamHeaders.Get("X-Init")
+			}
+		}
+	}()
+
+	close(releaseSecond)
+	<-bodyStarted
+	close(releaseBody)
+	<-dataDone
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected stream error: %+v", msg)
+		}
+	}
+	close(stopReading)
+	<-readerDone
+	if upstreamHeaders.Get("X-Init") != "plugin" || upstreamHeaders.Get("X-Body") != "" {
+		t.Fatalf("returned headers mutated after return: %#v", upstreamHeaders)
 	}
 }
 
