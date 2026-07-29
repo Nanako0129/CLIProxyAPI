@@ -271,7 +271,6 @@ nonstream-keepalive-interval: 0
 #   compact:
 #     enabled: false
 #     max-duration-seconds: 600    # Absolute wall-clock per attempt; 0 disables timer; capped at 600.
-#   idle-timeout-seconds: 30       # Default: 0 (disabled). Max gap between upstream payloads; capped at 600.
 
 # Signature cache validation for thinking blocks (Antigravity/Claude).
 # When true (default), cached signatures are preferred and validated.

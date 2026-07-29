@@ -27,19 +27,6 @@ func StreamingBootstrapTimeout(cfg *config.SDKConfig) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-// StreamingIdleTimeout returns the configured maximum gap between upstream
-// stream payloads. Zero disables the timeout.
-func StreamingIdleTimeout(cfg *config.SDKConfig) time.Duration {
-	if cfg == nil || cfg.Streaming.IdleTimeoutSeconds <= 0 {
-		return 0
-	}
-	seconds := cfg.Streaming.IdleTimeoutSeconds
-	if seconds > int(maxStreamingBootstrapTimeout/time.Second) {
-		return maxStreamingBootstrapTimeout
-	}
-	return time.Duration(seconds) * time.Second
-}
-
 type streamBootstrapTimeoutError struct {
 	timeout time.Duration
 }
@@ -50,17 +37,6 @@ func (e *streamBootstrapTimeoutError) Error() string {
 
 func (e *streamBootstrapTimeoutError) Unwrap() error   { return context.DeadlineExceeded }
 func (e *streamBootstrapTimeoutError) StatusCode() int { return http.StatusGatewayTimeout }
-
-type streamIdleTimeoutError struct {
-	timeout time.Duration
-}
-
-func (e *streamIdleTimeoutError) Error() string {
-	return fmt.Sprintf("upstream stream produced no payload for %s", e.timeout)
-}
-
-func (e *streamIdleTimeoutError) Unwrap() error   { return context.DeadlineExceeded }
-func (e *streamIdleTimeoutError) StatusCode() int { return http.StatusGatewayTimeout }
 
 // streamBootstrapAttempt uses cancellation rather than a context deadline so
 // the bootstrap timer can be removed after the first payload without imposing
@@ -107,8 +83,7 @@ func (a *streamBootstrapAttempt) disarm() bool {
 
 func (h *BaseAPIHandler) executeStreamBootstrapAttempt(ctx context.Context, providers []string, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
 	bootstrapTimeout := StreamingBootstrapTimeout(h.Cfg)
-	idleTimeout := StreamingIdleTimeout(h.Cfg)
-	if bootstrapTimeout <= 0 && idleTimeout <= 0 {
+	if bootstrapTimeout <= 0 {
 		return h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	}
 
@@ -122,66 +97,10 @@ func (h *BaseAPIHandler) executeStreamBootstrapAttempt(ctx context.Context, prov
 		attempt.cancel()
 		return nil, err
 	}
-	return releaseStreamBootstrapAttempt(result, attempt.ctx, attempt.cancel, idleTimeout), nil
+	return releaseStreamBootstrapAttempt(result, attempt.ctx, attempt.cancel), nil
 }
 
-func receiveStreamChunkWithIdleTimeout(ctx context.Context, chunks <-chan coreexecutor.StreamChunk, timeout time.Duration) (coreexecutor.StreamChunk, bool, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return coreexecutor.StreamChunk{}, false, err
-	}
-	if timeout <= 0 {
-		select {
-		case <-ctx.Done():
-			return coreexecutor.StreamChunk{}, false, ctx.Err()
-		case chunk, ok := <-chunks:
-			return chunk, ok, nil
-		}
-	}
-
-	timer := time.NewTimer(timeout)
-	defer func() {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return coreexecutor.StreamChunk{}, false, ctx.Err()
-		case chunk, ok := <-chunks:
-			if !ok || chunk.Err != nil || len(chunk.Payload) > 0 {
-				return chunk, ok, nil
-			}
-			// Executors may emit empty bookkeeping chunks for upstream events
-			// that translators intentionally suppress. Downstream drops them,
-			// so they are not stream progress and must not reset the idle timer.
-		case <-timer.C:
-			// Linearize cancellation at the timer wake, then prefer a meaningful
-			// upstream payload, terminal error, or clean close that is already
-			// observable at that instant.
-			if err := ctx.Err(); err != nil {
-				return coreexecutor.StreamChunk{}, false, err
-			}
-			select {
-			case chunk, ok := <-chunks:
-				if !ok || chunk.Err != nil || len(chunk.Payload) > 0 {
-					return chunk, ok, nil
-				}
-			default:
-			}
-			return coreexecutor.StreamChunk{}, false, &streamIdleTimeoutError{timeout: timeout}
-		}
-	}
-}
-
-func releaseStreamBootstrapAttempt(result *coreexecutor.StreamResult, ctx context.Context, cancel context.CancelFunc, idleTimeout time.Duration) *coreexecutor.StreamResult {
+func releaseStreamBootstrapAttempt(result *coreexecutor.StreamResult, ctx context.Context, cancel context.CancelFunc) *coreexecutor.StreamResult {
 	if result == nil || result.Chunks == nil {
 		cancel()
 		return result
@@ -193,39 +112,21 @@ func releaseStreamBootstrapAttempt(result *coreexecutor.StreamResult, ctx contex
 		defer close(out)
 		defer cancel()
 		for {
-			chunk, ok, err := receiveStreamChunkWithIdleTimeout(ctx, remaining, idleTimeout)
-			if err != nil {
-				var timeoutErr *streamIdleTimeoutError
-				if !errors.As(err, &timeoutErr) {
-					return
-				}
-				// Cancellation observed before the unbuffered send wins. Once the
-				// send completes, the timeout is the single terminal result.
-				if ctx.Err() != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case chunk, ok := <-remaining:
+				if !ok {
 					return
 				}
 				select {
 				case <-ctx.Done():
 					return
-				case out <- coreexecutor.StreamChunk{Err: timeoutErr}:
+				case out <- chunk:
 				}
-				return
-			}
-			if !ok {
-				return
-			}
-			// The idle timer is no longer armed while downstream delivery is
-			// blocked, so client backpressure cannot look like upstream idleness.
-			if ctx.Err() != nil {
-				return
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case out <- chunk:
-			}
-			if chunk.Err != nil {
-				return
+				if chunk.Err != nil {
+					return
+				}
 			}
 		}
 	}()
