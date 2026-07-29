@@ -82,7 +82,9 @@ func claudeStreamChunksCommitOutput(chunks [][]byte) bool {
 				continue
 			case "content_block_start":
 				switch event.Get("content_block.type").String() {
-				case "thinking", "redacted_thinking", "text":
+				case "thinking":
+					return true
+				case "redacted_thinking", "text":
 					continue
 				default:
 					return true

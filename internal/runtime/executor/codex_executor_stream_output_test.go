@@ -211,12 +211,11 @@ func TestCodexExecutorExecuteStreamMissingCompletionIsRequestScoped(t *testing.T
 	assertRequestScopedTestError(t, streamErr)
 }
 
-func TestCodexExecutorExecuteStreamCommitsThinkingDelta(t *testing.T) {
+func TestCodexExecutorExecuteStreamCommitsThinkingStart(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}` + "\n\n"))
 		_, _ = w.Write([]byte(`data: {"type":"response.reasoning_summary_part.added","item_id":"rs_1","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}` + "\n\n"))
-		_, _ = w.Write([]byte(`data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"working"}` + "\n\n"))
 	}))
 	defer server.Close()
 
@@ -257,7 +256,7 @@ func TestCodexExecutorExecuteStreamCommitsThinkingDelta(t *testing.T) {
 		t.Fatal("expected translated thinking payloads")
 	}
 	if !committed {
-		t.Fatal("expected translated thinking delta to commit the stream")
+		t.Fatal("expected translated thinking start to commit the stream")
 	}
 	if streamErr == nil {
 		t.Fatal("expected missing-completion stream error")
@@ -271,6 +270,8 @@ func TestClaudeStreamChunksCommitOutput(t *testing.T) {
 		want  bool
 	}{
 		{name: "message start", chunk: `data: {"type":"message_start"}`},
+		{name: "thinking block start", chunk: `data: {"type":"content_block_start","content_block":{"type":"thinking","thinking":""}}`, want: true},
+		{name: "redacted thinking block start", chunk: `data: {"type":"content_block_start","content_block":{"type":"redacted_thinking","data":"hidden"}}`},
 		{name: "empty thinking delta", chunk: `data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":""}}`},
 		{name: "thinking delta", chunk: `data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"working"}}`, want: true},
 		{name: "signature delta", chunk: `data: {"type":"content_block_delta","delta":{"type":"signature_delta","signature":"sig"}}`},
